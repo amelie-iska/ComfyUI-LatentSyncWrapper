@@ -5,7 +5,7 @@
 Star my fork of the repo! 
 
 ## Memory Usage 
-Memory usage is not below 12GB and should function as intended for smaller GPUs. Feel free to run it :) 
+Memory usage is now below 12GB of VRAM and should function as intended for smaller GPUs. Feel free to run it :) 
 
 ## Credits
 
