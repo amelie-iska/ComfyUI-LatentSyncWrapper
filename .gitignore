@@ -171,3 +171,11 @@ cython_debug/
 .pypirc
 
 checkpoints/
+*.7z*
+*.part
+*.tmp
+*.temp
+*~
+.DS_Store
+temp/
+tmp/
