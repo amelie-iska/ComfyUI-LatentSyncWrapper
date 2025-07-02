@@ -46,12 +46,23 @@ def optimized_inference_context(device='cuda'):
             print(f"Inference used {memory_used:.2f}GB additional memory")
 
 
-def optimize_inference_pipeline(pipeline):
+def optimize_inference_pipeline(pipeline, enable_optimizations=None):
     """Optimize the inference pipeline for lower memory usage"""
     
+    # Default optimizations if not specified
+    if enable_optimizations is None:
+        enable_optimizations = {
+            "flash_attention": True,
+            "vae_slicing": True,
+            "vae_tiling": True,
+            "attention_slicing": True,
+            "cpu_offload": False,
+            "gradient_checkpointing": False,
+        }
+    
     if hasattr(pipeline, 'unet'):
-        # Enable memory efficient attention if available
-        if hasattr(pipeline.unet, 'set_attn_processor'):
+        # Enable memory efficient attention if available and requested
+        if enable_optimizations.get("flash_attention", True) and hasattr(pipeline.unet, 'set_attn_processor'):
             try:
                 from diffusers.models.attention_processor import AttnProcessor2_0
                 pipeline.unet.set_attn_processor(AttnProcessor2_0())
@@ -59,39 +70,40 @@ def optimize_inference_pipeline(pipeline):
             except:
                 print("Could not enable memory efficient attention")
         
-        # Enable gradient checkpointing if available
-        if hasattr(pipeline.unet, 'enable_gradient_checkpointing'):
+        # Enable gradient checkpointing if available and requested
+        if enable_optimizations.get("gradient_checkpointing", False) and hasattr(pipeline.unet, 'enable_gradient_checkpointing'):
             pipeline.unet.enable_gradient_checkpointing()
             print("Enabled gradient checkpointing for UNet")
     
     if hasattr(pipeline, 'vae'):
-        # Enable sliced decoding for VAE
-        if hasattr(pipeline.vae, 'enable_slicing'):
+        # Enable sliced decoding for VAE if requested
+        if enable_optimizations.get("vae_slicing", True) and hasattr(pipeline.vae, 'enable_slicing'):
             pipeline.vae.enable_slicing()
             print("Enabled VAE slicing")
         
-        # Enable tiled decoding for VAE
-        if hasattr(pipeline.vae, 'enable_tiling'):
+        # Enable tiled decoding for VAE if requested
+        if enable_optimizations.get("vae_tiling", True) and hasattr(pipeline.vae, 'enable_tiling'):
             pipeline.vae.enable_tiling()
             print("Enabled VAE tiling")
     
     # Set the pipeline to use less memory
-    if hasattr(pipeline, 'enable_attention_slicing'):
+    if enable_optimizations.get("attention_slicing", True) and hasattr(pipeline, 'enable_attention_slicing'):
         pipeline.enable_attention_slicing(1)
         print("Enabled attention slicing")
     
-    if hasattr(pipeline, 'enable_vae_slicing'):
+    if enable_optimizations.get("vae_slicing", True) and hasattr(pipeline, 'enable_vae_slicing'):
         pipeline.enable_vae_slicing()
         print("Enabled VAE slicing via pipeline")
     
-    if hasattr(pipeline, 'enable_sequential_cpu_offload'):
-        # This moves models to CPU after each step
-        pipeline.enable_sequential_cpu_offload()
-        print("Enabled sequential CPU offload")
-    elif hasattr(pipeline, 'enable_model_cpu_offload'):
-        # Alternative CPU offload method
-        pipeline.enable_model_cpu_offload()
-        print("Enabled model CPU offload")
+    if enable_optimizations.get("cpu_offload", False):
+        if hasattr(pipeline, 'enable_sequential_cpu_offload'):
+            # This moves models to CPU after each step
+            pipeline.enable_sequential_cpu_offload()
+            print("Enabled sequential CPU offload")
+        elif hasattr(pipeline, 'enable_model_cpu_offload'):
+            # Alternative CPU offload method
+            pipeline.enable_model_cpu_offload()
+            print("Enabled model CPU offload")
     
     return pipeline
 

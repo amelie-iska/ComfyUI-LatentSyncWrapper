@@ -10,6 +10,7 @@ import gc
 from .memory_limiter import limit_gpu_memory, clear_cache_periodically, log_memory_usage
 from .inference_optimizer import optimized_inference_context, optimize_inference_pipeline, reduce_inference_lag
 from .gpu_monitor import gpu_monitor
+from .adaptive_gpu_config import AdaptiveGPUConfig, auto_configure_gpu
 
 # Apply GPU memory limit immediately after importing
 limit_gpu_memory()
@@ -447,6 +448,9 @@ class LatentSyncNode:
         
         check_and_install_dependencies()
         setup_models()
+        
+        # Initialize adaptive GPU configuration
+        self.gpu_config = None
 
     @classmethod
     def INPUT_TYPES(s):
@@ -456,6 +460,7 @@ class LatentSyncNode:
                     "seed": ("INT", {"default": 1247}),
                     "lips_expression": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 3.0, "step": 0.1}),
                     "inference_steps": ("INT", {"default": 20, "min": 1, "max": 999, "step": 1}),
+                    "vram_fraction": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.05, "display": "slider"}),
                  },}
 
     CATEGORY = "LatentSyncNode"
@@ -475,43 +480,46 @@ class LatentSyncNode:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
 
-    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20):
+    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0):
         # Use our module temp directory
         global MODULE_TEMP_DIR
         
-        # Get GPU capabilities and memory
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        BATCH_SIZE = 4
-        use_mixed_precision = False
+        # Initialize adaptive GPU configuration
+        # Use custom vram_fraction if set (0.0 means auto)
+        custom_vram = vram_fraction if vram_fraction > 0 else None
+        
+        # Create or update GPU configuration
+        if self.gpu_config is None or custom_vram != getattr(self.gpu_config, 'custom_vram_fraction', None):
+            self.gpu_config = AdaptiveGPUConfig(custom_vram_fraction=custom_vram)
+            self.gpu_config.apply_memory_limit()
+            self.gpu_config.log_config()
+        
+        # Get optimal settings from GPU config
+        gpu_settings = self.gpu_config.get_optimal_settings(task="inference")
+        
+        # Extract settings
+        device = gpu_settings["device"]
+        BATCH_SIZE = gpu_settings["batch_size"]
+        use_mixed_precision = self.gpu_config.profile.use_mixed_precision
+        enable_tf32 = self.gpu_config.profile.enable_tf32
+        
+        # Override inference steps if user specified
+        if inference_steps != 20:  # If not default
+            gpu_settings["inference_steps"] = inference_steps
+        else:
+            inference_steps = gpu_settings["inference_steps"]
+        
+        # Log current settings
+        print(f"\nUsing adaptive GPU settings:")
+        print(f"  Batch Size: {BATCH_SIZE}")
+        print(f"  Inference Steps: {inference_steps}")
+        print(f"  VRAM Fraction: {self.gpu_config.profile.vram_fraction:.1%}")
+        print(f"  Mixed Precision: {use_mixed_precision}")
+        
+        # Clear GPU cache before processing
         if torch.cuda.is_available():
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory
-            # Convert to GB
-            gpu_mem_gb = gpu_mem / (1024 ** 3)
-
-            # Dynamically adjust batch size based on GPU memory - VERY conservative for lag reduction
-            if gpu_mem_gb > 20:  # High-end GPUs
-                BATCH_SIZE = 4    # Further reduced from 8
-                enable_tf32 = True
-                use_mixed_precision = True
-            elif gpu_mem_gb > 8:  # Mid-range GPUs
-                BATCH_SIZE = 2    # Further reduced from 4
-                enable_tf32 = False
-                use_mixed_precision = True
-            else:  # Lower-end GPUs
-                BATCH_SIZE = 1    # Further reduced from 2
-                enable_tf32 = False
-                use_mixed_precision = False
-
-            # Set performance options based on GPU capability
-            torch.backends.cudnn.benchmark = True
-            if enable_tf32:
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-
-            # Clear GPU cache before processing and set memory fraction
             torch.cuda.empty_cache()
-            limit_gpu_memory()
-            log_memory_usage("After memory limit set")
+            log_memory_usage("After adaptive configuration")
 
 
         # Create a run-specific subdirectory in our temp directory
@@ -622,16 +630,18 @@ class LatentSyncNode:
             # Create config and args
             config = OmegaConf.load(config_path)
             
-            # Override config for better performance and less lag
+            # Override config with adaptive GPU settings
             if hasattr(config, 'data'):
-                # Reduce number of frames processed at once
-                if hasattr(config.data, 'num_frames') and config.data.num_frames > 8:
-                    print(f"Reducing num_frames from {config.data.num_frames} to 8 to reduce lag")
-                    config.data.num_frames = 8
+                # Use adaptive num_frames setting
+                optimal_num_frames = gpu_settings.get('num_frames', 8)
+                if hasattr(config.data, 'num_frames'):
+                    if config.data.num_frames != optimal_num_frames:
+                        print(f"Setting num_frames to {optimal_num_frames} based on GPU profile")
+                        config.data.num_frames = optimal_num_frames
                 
-                # Ensure batch size is 1 for minimum lag
+                # Use adaptive batch size
                 if hasattr(config.data, 'batch_size'):
-                    config.data.batch_size = 1
+                    config.data.batch_size = 1  # Keep at 1 for pipeline compatibility
 
             # Set the correct mask image path
             mask_image_path = os.path.join(cur_dir, "latentsync", "utils", "mask.png")
@@ -663,7 +673,8 @@ class LatentSyncNode:
                 batch_size=BATCH_SIZE,
                 use_mixed_precision=use_mixed_precision,
                 temp_dir=temp_dir,
-                mask_image_path=mask_image_path
+                mask_image_path=mask_image_path,
+                enable_optimizations=self.gpu_config.profile.enable_optimizations
             )
 
             # Set PYTHONPATH to include our directories 
@@ -695,8 +706,12 @@ class LatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
-            # Optimize config and args for reduced lag
-            config, args = reduce_inference_lag(config, args)
+            # Only apply lag reduction if we're not using adaptive config
+            # The adaptive config already optimizes settings
+            if custom_vram is None:
+                config, args = reduce_inference_lag(config, args)
+            else:
+                print("Using adaptive GPU configuration - skipping lag reduction")
             
             # Log memory before inference
             log_memory_usage("Before inference")
@@ -708,9 +723,13 @@ class LatentSyncNode:
                 # Run inference with optimized context and gradient tracking disabled
                 with optimized_inference_context(device=device):
                     with torch.inference_mode():
-                        # Check if pipeline can be optimized
+                        # Check if pipeline can be optimized with adaptive settings
                         if hasattr(inference_module, 'pipeline'):
-                            inference_module.pipeline = optimize_inference_pipeline(inference_module.pipeline)
+                            optimizations = self.gpu_config.profile.enable_optimizations
+                            inference_module.pipeline = optimize_inference_pipeline(
+                                inference_module.pipeline, 
+                                enable_optimizations=optimizations
+                            )
                         
                         inference_module.main(config, args)
             finally:
