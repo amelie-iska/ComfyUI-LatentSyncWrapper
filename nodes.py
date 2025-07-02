@@ -3,10 +3,13 @@ import tempfile
 import torchaudio
 import uuid
 import sys
+import sys
 import shutil
 from collections.abc import Mapping
 from datetime import datetime
 import gc
+from .memory_limiter import limit_gpu_memory
+
 
 # Function to find ComfyUI directories
 def get_comfyui_temp_dir():
@@ -501,9 +504,9 @@ class LatentSyncNode:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
 
-            # Clear GPU cache before processing
+            # Clear GPU cache before processing and set memory fraction
             torch.cuda.empty_cache()
-            torch.cuda.set_per_process_memory_fraction(0.8)
+            limit_gpu_memory()
 
         # Create a run-specific subdirectory in our temp directory
         run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))

@@ -9,6 +9,7 @@ from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
+import gc
 
 
 def main(config, args):
@@ -153,6 +154,11 @@ def main(config, args):
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
     )
+
+    # Explicitly free models to release GPU memory
+    del pipeline, unet, vae, audio_encoder, helper, scheduler
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 if __name__ == "__main__":
