@@ -3,6 +3,16 @@ import tempfile
 import torchaudio
 import uuid
 import sys
+import shutil
+from collections.abc import Mapping
+from datetime import datetime
+import gc
+from .memory_limiter import limit_gpu_memory
+
+# Apply GPU memory limit immediately after importing
+limit_gpu_memory()
+
+import sys
 import sys
 import shutil
 from collections.abc import Mapping
@@ -508,6 +518,11 @@ class LatentSyncNode:
             torch.cuda.empty_cache()
             limit_gpu_memory()
 
+            # Clear GPU cache before processing and set memory fraction
+            torch.cuda.empty_cache()
+            limit_gpu_memory()
+
+
         # Create a run-specific subdirectory in our temp directory
         run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
         temp_dir = os.path.join(MODULE_TEMP_DIR, f"run_{run_id}")
@@ -535,6 +550,18 @@ class LatentSyncNode:
             # Get the extension directory
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             
+            # Process input frames entirely on CPU to avoid unnecessary GPU
+            # memory usage before inference
+            if isinstance(images, list):
+                frames_cpu = torch.stack(images).cpu()
+            else:
+                frames_cpu = images.cpu()
+
+            frames_uint8 = (frames_cpu * 255).to(torch.uint8)
+            del frames_cpu
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             # Process input frames entirely on CPU to avoid unnecessary GPU
             # memory usage before inference
             if isinstance(images, list):
@@ -597,9 +624,41 @@ class LatentSyncNode:
                         packet = stream.encode(frame)
                         container.mux(packet)
 
+            # Move waveform to CPU for saving
+            waveform_cpu = waveform.cpu()
+            torchaudio.save(audio_path, waveform_cpu, sample_rate)
+            del waveform_cpu
+            gc.collect()
+
+            # Write video frames
+            try:
+                import torchvision.io as io
+                io.write_video(temp_video_path, frames_uint8, fps=25, video_codec='h264')
+            except TypeError as e:
+                # Check if the error is specifically about macro_block_size
+                if "macro_block_size" in str(e):
+                    import imageio
+                    # Use imageio with macro_block_size parameter
+                    imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=25, codec='h264', macro_block_size=1)
+                else:
+                    # Fall back to original PyAV code for other TypeError issues
+                    import av
+                    container = av.open(temp_video_path, mode='w')
+                    stream = container.add_stream('h264', rate=25)
+                    stream.width = frames_uint8.shape[2]
+                    stream.height = frames_uint8.shape[1]
+
+                    for frame in frames_uint8:
+                        frame = av.VideoFrame.from_ndarray(frame.numpy(), format='rgb24')
+                        packet = stream.encode(frame)
+                        container.mux(packet)
+
                     packet = stream.encode(None)
                     container.mux(packet)
                     container.close()
+
+            del frames_uint8
+            gc.collect()
 
             del frames_uint8
             gc.collect()
@@ -676,6 +735,10 @@ class LatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
+            # Run inference without gradient tracking to reduce memory usage
+            with torch.inference_mode():
+                inference_module.main(config, args)
+
             # Run inference without gradient tracking to reduce memory usage
             with torch.inference_mode():
                 inference_module.main(config, args)
