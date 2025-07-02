@@ -8,6 +8,9 @@ os.environ.setdefault(
     "max_split_size_mb:256,garbage_collection_threshold:0.8",
 )
 
+import torch
+import gc
+
 
 def limit_gpu_memory(memory_fraction=None):
     """Limit GPU memory usage to a fraction of total VRAM."""
@@ -30,7 +33,6 @@ try:
     limit_gpu_memory()
 except Exception:
     pass
-
 
 def clear_cache_periodically():
     """Clear GPU cache to free memory."""
