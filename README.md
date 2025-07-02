@@ -1,4 +1,4 @@
-# ComfyUI-LatentSyncWrapper 1.6
+# ComfyUI-LatentSyncWrapper 1.6-Memsafe
 
 ## Support My Work
 
