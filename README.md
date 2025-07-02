@@ -78,6 +78,24 @@ soundfile
 DeepCache
 ```
 
+## VRAM Management
+
+This extension includes a small helper script `memory_limiter.py` to control how
+much GPU memory the node can use. By default it adjusts the allowed fraction
+based on your GPU size (up to 95% for a 24GB card like the RTX 4090).
+
+```bash
+python memory_limiter.py  # Optional standalone usage
+```
+
+`LatentSyncNode` automatically calls `limit_gpu_memory()` so you typically don't
+need to run the script manually.
+
+The extension sets the `PYTORCH_CUDA_ALLOC_CONF` environment variable on import
+so PyTorch respects the desired memory limit before any GPU allocations occur.
+You can override this value before launching ComfyUI if you need a different
+memory fraction.
+
 ## Manual Model Download Required
 
 **Important**: LatentSync 1.6 requires manual model downloads because the LatentSync 1.6 models are hosted on a private HuggingFace repository that cannot be automatically accessed. You must download the following models before first use:
