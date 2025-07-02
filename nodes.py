@@ -7,18 +7,12 @@ import shutil
 from collections.abc import Mapping
 from datetime import datetime
 import gc
-from .memory_limiter import limit_gpu_memory
+from .memory_limiter import limit_gpu_memory, clear_cache_periodically, log_memory_usage
+from .inference_optimizer import optimized_inference_context, optimize_inference_pipeline, reduce_inference_lag
+from .gpu_monitor import gpu_monitor
 
 # Apply GPU memory limit immediately after importing
 limit_gpu_memory()
-
-import sys
-import sys
-import shutil
-from collections.abc import Mapping
-from datetime import datetime
-import gc
-from .memory_limiter import limit_gpu_memory
 
 
 # Function to find ComfyUI directories
@@ -494,17 +488,17 @@ class LatentSyncNode:
             # Convert to GB
             gpu_mem_gb = gpu_mem / (1024 ** 3)
 
-            # Dynamically adjust batch size based on GPU memory
+            # Dynamically adjust batch size based on GPU memory - VERY conservative for lag reduction
             if gpu_mem_gb > 20:  # High-end GPUs
-                BATCH_SIZE = 32
+                BATCH_SIZE = 4    # Further reduced from 8
                 enable_tf32 = True
                 use_mixed_precision = True
             elif gpu_mem_gb > 8:  # Mid-range GPUs
-                BATCH_SIZE = 16
+                BATCH_SIZE = 2    # Further reduced from 4
                 enable_tf32 = False
                 use_mixed_precision = True
             else:  # Lower-end GPUs
-                BATCH_SIZE = 8
+                BATCH_SIZE = 1    # Further reduced from 2
                 enable_tf32 = False
                 use_mixed_precision = False
 
@@ -517,10 +511,7 @@ class LatentSyncNode:
             # Clear GPU cache before processing and set memory fraction
             torch.cuda.empty_cache()
             limit_gpu_memory()
-
-            # Clear GPU cache before processing and set memory fraction
-            torch.cuda.empty_cache()
-            limit_gpu_memory()
+            log_memory_usage("After memory limit set")
 
 
         # Create a run-specific subdirectory in our temp directory
@@ -550,18 +541,6 @@ class LatentSyncNode:
             # Get the extension directory
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             
-            # Process input frames entirely on CPU to avoid unnecessary GPU
-            # memory usage before inference
-            if isinstance(images, list):
-                frames_cpu = torch.stack(images).cpu()
-            else:
-                frames_cpu = images.cpu()
-
-            frames_uint8 = (frames_cpu * 255).to(torch.uint8)
-            del frames_cpu
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
             # Process input frames entirely on CPU to avoid unnecessary GPU
             # memory usage before inference
             if isinstance(images, list):
@@ -624,44 +603,14 @@ class LatentSyncNode:
                         packet = stream.encode(frame)
                         container.mux(packet)
 
-            # Move waveform to CPU for saving
-            waveform_cpu = waveform.cpu()
-            torchaudio.save(audio_path, waveform_cpu, sample_rate)
-            del waveform_cpu
-            gc.collect()
-
-            # Write video frames
-            try:
-                import torchvision.io as io
-                io.write_video(temp_video_path, frames_uint8, fps=25, video_codec='h264')
-            except TypeError as e:
-                # Check if the error is specifically about macro_block_size
-                if "macro_block_size" in str(e):
-                    import imageio
-                    # Use imageio with macro_block_size parameter
-                    imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=25, codec='h264', macro_block_size=1)
-                else:
-                    # Fall back to original PyAV code for other TypeError issues
-                    import av
-                    container = av.open(temp_video_path, mode='w')
-                    stream = container.add_stream('h264', rate=25)
-                    stream.width = frames_uint8.shape[2]
-                    stream.height = frames_uint8.shape[1]
-
-                    for frame in frames_uint8:
-                        frame = av.VideoFrame.from_ndarray(frame.numpy(), format='rgb24')
-                        packet = stream.encode(frame)
-                        container.mux(packet)
-
                     packet = stream.encode(None)
                     container.mux(packet)
                     container.close()
 
             del frames_uint8
             gc.collect()
-
-            del frames_uint8
-            gc.collect()
+            clear_cache_periodically()
+            log_memory_usage("After video encoding")
 
             # Define paths to required files and configs
             inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
@@ -672,6 +621,17 @@ class LatentSyncNode:
 
             # Create config and args
             config = OmegaConf.load(config_path)
+            
+            # Override config for better performance and less lag
+            if hasattr(config, 'data'):
+                # Reduce number of frames processed at once
+                if hasattr(config.data, 'num_frames') and config.data.num_frames > 8:
+                    print(f"Reducing num_frames from {config.data.num_frames} to 8 to reduce lag")
+                    config.data.num_frames = 8
+                
+                # Ensure batch size is 1 for minimum lag
+                if hasattr(config.data, 'batch_size'):
+                    config.data.batch_size = 1
 
             # Set the correct mask image path
             mask_image_path = os.path.join(cur_dir, "latentsync", "utils", "mask.png")
@@ -735,17 +695,46 @@ class LatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
-            # Run inference without gradient tracking to reduce memory usage
-            with torch.inference_mode():
-                inference_module.main(config, args)
+            # Optimize config and args for reduced lag
+            config, args = reduce_inference_lag(config, args)
+            
+            # Log memory before inference
+            log_memory_usage("Before inference")
+            
+            # Start GPU monitoring to diagnose lag
+            gpu_monitor.start()
+            
+            try:
+                # Run inference with optimized context and gradient tracking disabled
+                with optimized_inference_context(device=device):
+                    with torch.inference_mode():
+                        # Check if pipeline can be optimized
+                        if hasattr(inference_module, 'pipeline'):
+                            inference_module.pipeline = optimize_inference_pipeline(inference_module.pipeline)
+                        
+                        inference_module.main(config, args)
+            finally:
+                # Stop GPU monitoring
+                gpu_monitor.stop()
 
-            # Run inference without gradient tracking to reduce memory usage
-            with torch.inference_mode():
-                inference_module.main(config, args)
+            # Clean up models from inference module
+            if hasattr(inference_module, 'pipeline'):
+                if hasattr(inference_module.pipeline, 'unet'):
+                    del inference_module.pipeline.unet
+                if hasattr(inference_module.pipeline, 'vae'):
+                    del inference_module.pipeline.vae
+                if hasattr(inference_module.pipeline, 'audio_encoder'):
+                    del inference_module.pipeline.audio_encoder
+                del inference_module.pipeline
 
+            # Force cleanup
+            gc.collect()
+            
             # Clean GPU cache after inference
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                clear_cache_periodically()
+                log_memory_usage("After inference")
 
             # Verify output file exists
             if not os.path.exists(output_video_path):

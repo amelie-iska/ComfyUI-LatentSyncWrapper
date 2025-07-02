@@ -251,6 +251,7 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
+    @torch.no_grad()
     def affine_transform_video(self, video_frames: np.ndarray):
         faces = []
         boxes = []
@@ -265,6 +266,7 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = torch.stack(faces)
         return faces, boxes, affine_matrices
 
+    @torch.no_grad()
     def restore_video(self, faces: torch.Tensor, video_frames: np.ndarray, boxes: list, affine_matrices: list):
         video_frames = video_frames[: len(faces)]
         out_frames = []
@@ -280,6 +282,7 @@ class LipsyncPipeline(DiffusionPipeline):
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
+    @torch.no_grad()
     def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
         # If the audio is longer than the video, we need to loop the video
         if len(whisper_chunks) > len(video_frames):
@@ -390,6 +393,11 @@ class LipsyncPipeline(DiffusionPipeline):
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            # Clear GPU cache periodically to prevent lag
+            if i > 0 and i % 2 == 0:
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
             if self.unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
@@ -464,6 +472,18 @@ class LipsyncPipeline(DiffusionPipeline):
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
             synced_video_frames.append(decoded_latents)
+            
+            # Clear intermediate tensors to free memory
+            del latents, mask_latents, masked_image_latents, ref_latents
+            del decoded_latents, noise_pred
+            if 'unet_input' in locals():
+                del unet_input
+            
+            # Force garbage collection every few iterations
+            if (i + 1) % 3 == 0:
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
 
         synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
 
