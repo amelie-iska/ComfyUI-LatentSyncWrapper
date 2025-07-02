@@ -6,6 +6,7 @@ import sys
 import shutil
 from collections.abc import Mapping
 from datetime import datetime
+import gc
 
 # Function to find ComfyUI directories
 def get_comfyui_temp_dir():
@@ -531,17 +532,17 @@ class LatentSyncNode:
             # Get the extension directory
             cur_dir = os.path.dirname(os.path.abspath(__file__))
             
-            # Process input frames
+            # Process input frames entirely on CPU to avoid unnecessary GPU
+            # memory usage before inference
             if isinstance(images, list):
-                frames = torch.stack(images).to(device)
+                frames_cpu = torch.stack(images).cpu()
             else:
-                frames = images.to(device)
- 
-            frames_cpu = frames.cpu()  
-            del frames  
-            torch.cuda.empty_cache()  
+                frames_cpu = images.cpu()
 
-            frames = (frames_cpu * 255).to(torch.uint8)
+            frames_uint8 = (frames_cpu * 255).to(torch.uint8)
+            del frames_cpu
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Process audio with device awareness
             waveform = audio["waveform"].to(device)
@@ -567,27 +568,28 @@ class LatentSyncNode:
             # Move waveform to CPU for saving
             waveform_cpu = waveform.cpu()
             torchaudio.save(audio_path, waveform_cpu, sample_rate)
+            del waveform_cpu
+            gc.collect()
 
-            # Move frames to CPU for saving to video
-            frames_cpu = frames.cpu()
+            # Write video frames
             try:
                 import torchvision.io as io
-                io.write_video(temp_video_path, frames_cpu, fps=25, video_codec='h264')
+                io.write_video(temp_video_path, frames_uint8, fps=25, video_codec='h264')
             except TypeError as e:
                 # Check if the error is specifically about macro_block_size
                 if "macro_block_size" in str(e):
                     import imageio
                     # Use imageio with macro_block_size parameter
-                    imageio.mimsave(temp_video_path, frames_cpu.numpy(), fps=25, codec='h264', macro_block_size=1)
+                    imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=25, codec='h264', macro_block_size=1)
                 else:
                     # Fall back to original PyAV code for other TypeError issues
                     import av
                     container = av.open(temp_video_path, mode='w')
                     stream = container.add_stream('h264', rate=25)
-                    stream.width = frames_cpu.shape[2]
-                    stream.height = frames_cpu.shape[1]
+                    stream.width = frames_uint8.shape[2]
+                    stream.height = frames_uint8.shape[1]
 
-                    for frame in frames_cpu:
+                    for frame in frames_uint8:
                         frame = av.VideoFrame.from_ndarray(frame.numpy(), format='rgb24')
                         packet = stream.encode(frame)
                         container.mux(packet)
@@ -595,6 +597,9 @@ class LatentSyncNode:
                     packet = stream.encode(None)
                     container.mux(packet)
                     container.close()
+
+            del frames_uint8
+            gc.collect()
 
             # Define paths to required files and configs
             inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
@@ -668,8 +673,9 @@ class LatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
-            # Run inference
-            inference_module.main(config, args)
+            # Run inference without gradient tracking to reduce memory usage
+            with torch.inference_mode():
+                inference_module.main(config, args)
 
             # Clean GPU cache after inference
             if torch.cuda.is_available():
