@@ -11,6 +11,7 @@ from .memory_limiter import limit_gpu_memory, clear_cache_periodically, log_memo
 from .inference_optimizer import optimized_inference_context, optimize_inference_pipeline, reduce_inference_lag
 from .gpu_monitor import gpu_monitor
 from .adaptive_gpu_config import AdaptiveGPUConfig, auto_configure_gpu
+from .speed_optimizer import apply_speed_optimizations, dynamic_inference_steps, cuda_graphs_context, DeepCacheOptimizer
 
 # Apply GPU memory limit immediately after importing
 limit_gpu_memory()
@@ -461,6 +462,7 @@ class LatentSyncNode:
                     "lips_expression": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 3.0, "step": 0.1}),
                     "inference_steps": ("INT", {"default": 20, "min": 1, "max": 999, "step": 1}),
                     "vram_fraction": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.05, "display": "slider"}),
+                    "optimization_level": (["conservative", "balanced", "aggressive"], {"default": "balanced"}),
                  },}
 
     CATEGORY = "LatentSyncNode"
@@ -480,7 +482,7 @@ class LatentSyncNode:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
 
-    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0):
+    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced"):
         # Use our module temp directory
         global MODULE_TEMP_DIR
         
@@ -635,6 +637,9 @@ class LatentSyncNode:
                 # Use adaptive num_frames setting
                 optimal_num_frames = gpu_settings.get('num_frames', 8)
                 if hasattr(config.data, 'num_frames'):
+                    # For high-end GPUs with custom VRAM, don't reduce num_frames
+                    if custom_vram and self.gpu_config.gpu_info["vram_gb"] >= 20:
+                        optimal_num_frames = 16  # Use full 16 frames for RTX 4090/3090
                     if config.data.num_frames != optimal_num_frames:
                         print(f"Setting num_frames to {optimal_num_frames} based on GPU profile")
                         config.data.num_frames = optimal_num_frames
@@ -706,12 +711,29 @@ class LatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
-            # Only apply lag reduction if we're not using adaptive config
-            # The adaptive config already optimizes settings
-            if custom_vram is None:
+            # Apply speed optimizations based on user preference and GPU capability
+            print(f"Using optimization level: {optimization_level}")
+            
+            if custom_vram is None or self.gpu_config.gpu_info["vram_gb"] < 12:
                 config, args = reduce_inference_lag(config, args)
+                # Low VRAM GPUs should use conservative optimization
+                if optimization_level == "aggressive":
+                    optimization_level = "balanced"
+                    print("Downgrading to balanced optimization for GPU with <12GB VRAM")
             else:
-                print("Using adaptive GPU configuration - skipping lag reduction")
+                print("Using adaptive GPU configuration for high-end GPU - keeping optimized settings")
+                # For RTX 4090, allow higher batch sizes
+                if "4090" in self.gpu_config.gpu_info["name"]:
+                    if optimization_level == "aggressive":
+                        args.batch_size = min(20, args.batch_size)  # Allow up to 20 for 4090 aggressive
+                    else:
+                        args.batch_size = min(16, args.batch_size)  # Allow up to 16 for 4090 otherwise
+                    
+                # Apply dynamic inference step reduction based on optimization level
+                if optimization_level != "conservative":
+                    original_steps = args.inference_steps
+                    args.inference_steps = dynamic_inference_steps(original_steps, optimization_level)
+                    print(f"Optimized inference steps: {original_steps} -> {args.inference_steps}")
             
             # Log memory before inference
             log_memory_usage("Before inference")
@@ -730,8 +752,22 @@ class LatentSyncNode:
                                 inference_module.pipeline, 
                                 enable_optimizations=optimizations
                             )
+                            
+                            # Apply additional speed optimizations for high-end GPUs
+                            if optimization_level != "conservative":
+                                inference_module.pipeline, speed_opts = apply_speed_optimizations(
+                                    inference_module.pipeline,
+                                    self.gpu_config.gpu_info,
+                                    optimization_level
+                                )
+                                print(f"Applied speed optimizations: {speed_opts}")
                         
-                        inference_module.main(config, args)
+                        # Use CUDA graphs for RTX 4090 with aggressive optimization
+                        if optimization_level == "aggressive" and "4090" in self.gpu_config.gpu_info["name"]:
+                            with cuda_graphs_context():
+                                inference_module.main(config, args)
+                        else:
+                            inference_module.main(config, args)
             finally:
                 # Stop GPU monitoring
                 gpu_monitor.stop()
