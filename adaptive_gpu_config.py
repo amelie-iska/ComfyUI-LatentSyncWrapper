@@ -31,9 +31,9 @@ class AdaptiveGPUConfig:
             name="RTX 4090",
             vram_gb=24,
             compute_capability=(8, 9),
-            batch_size=12,  # Increased from 4 for better 4090 utilization
+            batch_size=8,  # Reduced from 12 to prevent display lag
             num_frames=16,  # Can handle full 16 frames
-            inference_steps=20,
+            inference_steps=15,  # Reduced from 20 for faster inference
             use_mixed_precision=True,
             enable_tf32=True,
             vram_fraction=0.85,  # Can use more VRAM safely
@@ -44,6 +44,10 @@ class AdaptiveGPUConfig:
                 "cpu_offload": False,  # Don't need CPU offload
                 "gradient_checkpointing": False,
                 "attention_slicing": False,  # Don't need slicing
+                "enable_time_slicing": True,  # New: time-sliced execution
+                "display_priority_mode": True,  # New: prioritize display
+                "yield_frequency_ms": 1,  # New: yield every 1ms
+                "async_execution": True  # New: async GPU operations
             }
         ),
         "RTX 4080": GPUProfile(

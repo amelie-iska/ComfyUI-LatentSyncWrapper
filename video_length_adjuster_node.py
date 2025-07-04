@@ -94,57 +94,6 @@ class VideoLengthAdjusterNode:
         return (adjusted_tensor, audio_output)
 
 
-class MemoryModeSelector:
-    """
-    Node to select memory processing mode for LatentSync
-    """
-    
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "mode": (["aggressive", "balanced", "conservative"], {"default": "balanced"}),
-                "enable_disk_cache": ("BOOLEAN", {"default": True}),
-                "long_video_threshold": ("INT", {"default": 200, "min": 50, "max": 1000, "step": 10}),
-            }
-        }
-    
-    RETURN_TYPES = ("MEMORY_CONFIG",)
-    RETURN_NAMES = ("config",)
-    FUNCTION = "create_config"
-    CATEGORY = "LatentSyncNode"
-    
-    def create_config(self, mode="balanced", enable_disk_cache=True, long_video_threshold=200):
-        """Create memory configuration"""
-        config = {
-            "mode": mode,
-            "enable_disk_cache": enable_disk_cache,
-            "long_video_threshold": long_video_threshold,
-            "settings": {
-                "aggressive": {
-                    "vram_fraction": 0.95,
-                    "batch_size_multiplier": 1.5,
-                    "enable_optimizations": True,
-                    "max_frames_in_memory": 32,
-                },
-                "balanced": {
-                    "vram_fraction": 0.85,
-                    "batch_size_multiplier": 1.0,
-                    "enable_optimizations": True,
-                    "max_frames_in_memory": 16,
-                },
-                "conservative": {
-                    "vram_fraction": 0.70,
-                    "batch_size_multiplier": 0.5,
-                    "enable_optimizations": False,
-                    "max_frames_in_memory": 8,
-                }
-            }[mode]
-        }
-        
-        return (config,)
-
-
 class VideoChunkProcessor:
     """
     Process video in chunks for very long videos
@@ -191,13 +140,11 @@ class VideoChunkProcessor:
 VIDEO_NODE_CLASS_MAPPINGS = {
     "VideoLengthAdjuster": VideoLengthAdjusterNode,  # Legacy name for compatibility
     "VideoLengthAdjusterNode": VideoLengthAdjusterNode,
-    # MemoryModeSelector removed - redundant with main node's memory_mode parameter
     "VideoChunkProcessor": VideoChunkProcessor,
 }
 
 VIDEO_NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoLengthAdjuster": "🎬 Video Length Adjuster (MEMSAFE)",  # Legacy name for compatibility
     "VideoLengthAdjusterNode": "🎬 Video Length Adjuster Enhanced (MEMSAFE)",
-    # MemoryModeSelector removed - redundant with main node's memory_mode parameter
     "VideoChunkProcessor": "🎞️ Video Chunk Processor (MEMSAFE)",
 }

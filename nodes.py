@@ -8,13 +8,46 @@ import time
 from collections.abc import Mapping
 from datetime import datetime
 import gc
+import warnings
+
+# Suppress non-critical warnings
+warnings.filterwarnings('ignore', message='Failed to load FFmpeg')
+warnings.filterwarnings('ignore', message='libavutil')
+warnings.filterwarnings('ignore', message='The video decoding and encoding capabilities of torchvision are deprecated')
+
+# Patch tqdm to prevent UI blocking
+from .tqdm_patch import patch_tqdm, patch_diffusers_progress
+patch_tqdm()
+# Also patch diffusers after importing
+import sys
+if 'diffusers' not in sys.modules:
+    # Force import diffusers so we can patch it
+    try:
+        import diffusers
+    except:
+        pass
+patch_diffusers_progress()
+
+# Apply comprehensive progress fixes
+try:
+    from .comprehensive_progress_fix import apply_all_progress_fixes
+    apply_all_progress_fixes()
+except Exception as e:
+    print(f"Warning: Could not apply comprehensive progress fixes: {e}")
 from .memory_limiter import limit_gpu_memory, clear_cache_periodically, log_memory_usage
 from .inference_optimizer import optimized_inference_context, optimize_inference_pipeline, reduce_inference_lag
 from .gpu_monitor import gpu_monitor
 from .adaptive_gpu_config import AdaptiveGPUConfig, auto_configure_gpu
+
+# Auto-import RTX 4090 optimizations
+try:
+    from . import rtx4090_config
+except:
+    pass
 from .speed_optimizer import apply_speed_optimizations, dynamic_inference_steps, cuda_graphs_context, DeepCacheOptimizer
 from .long_video_handler import LongVideoHandler, VideoLengthAdjuster, ProgressiveVideoProcessor
 from .memory_optimizer import InferenceMemoryOptimizer, FrameBufferManager, optimize_end_stage_inference
+from .gpu_throttle import gpu_friendly_inference, create_display_friendly_inference
 try:
     from .adaptive_memory_optimizer import create_adaptive_optimizer, integrate_adaptive_optimizer
     ADAPTIVE_MEMORY_AVAILABLE = True
@@ -165,6 +198,11 @@ def import_inference_script(script_path):
         raise ImportError(f"Failed to create module spec for {script_path}")
 
     module = importlib.util.module_from_spec(spec)
+    
+    # Ensure the module has access to standard modules
+    module.__dict__['os'] = os
+    module.__dict__['sys'] = sys
+    
     sys.modules[module_name] = module
 
     try:
@@ -203,6 +241,15 @@ def check_ffmpeg():
         return False
 
 def check_and_install_dependencies():
+    # Create a flag file to remember we've already installed packages
+    user_home = os.path.expanduser("~")
+    dependencies_installed_flag = os.path.join(user_home, ".latentsync16_dependencies_installed")
+    
+    # Skip installation if we've already done it before
+    if os.path.exists(dependencies_installed_flag):
+        print("Dependencies already installed from previous run")
+        return
+    
     if not check_ffmpeg():
         raise RuntimeError("FFmpeg is required but not found")
 
@@ -222,15 +269,6 @@ def check_and_install_dependencies():
         'diffusers',
         'ffmpeg-python' 
     ]
-
-    # Create a flag file to remember we've already installed packages
-    user_home = os.path.expanduser("~")
-    dependencies_installed_flag = os.path.join(user_home, ".latentsync16_dependencies_installed")
-    
-    # Skip installation if we've already done it before
-    if os.path.exists(dependencies_installed_flag):
-        print("Dependencies already installed from previous run")
-        return
         
     def is_package_installed(package_name):
         return importlib.util.find_spec(package_name) is not None
@@ -434,6 +472,9 @@ class LatentSyncNode:
         
         # Initialize adaptive GPU configuration
         self.gpu_config = None
+        
+        # Cache commonly used paths
+        self._cached_paths = {}
 
     @classmethod
     def INPUT_TYPES(s):
@@ -450,6 +491,9 @@ class LatentSyncNode:
                     "return_frames": ("BOOLEAN", {"default": False, "description": "Return frames (True) or video path (False)"}),
                     "output_mode": (["auto", "video_file", "frames"], {"default": "auto", "description": "auto: choose based on video length"}),
                     "attention_mode": (["flash", "flex", "xformers", "standard"], {"default": "flash", "description": "Attention mechanism to use"}),
+                    "speed_mode": (["normal", "fast", "turbo", "ultra"], {"default": "normal", "description": "Speed optimization mode"}),
+                    "quality_preset": (["auto", "draft", "fast", "balanced", "quality", "ultra"], {"default": "auto", "description": "Quality vs speed preset"}),
+                    "enable_deepcache": ("BOOLEAN", {"default": False, "description": "Enable DeepCache for 2x speedup"}),
                  },}
 
     CATEGORY = "LatentSyncNode"
@@ -468,10 +512,51 @@ class LatentSyncNode:
             if processed_batch.shape[-1] == 4:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
+    
+    def _apply_speed_optimizations(self, pipeline, speed_mode="normal", quality_preset="auto", enable_deepcache=False):
+        """Apply speed optimizations to the pipeline using unified optimizer"""
+        
+        print(f"⚡ Applying speed optimizations: mode={speed_mode}, preset={quality_preset}, deepcache={enable_deepcache}")
+        
+        # Import unified optimization module
+        try:
+            from .unified_speed_optimizer import optimize_inference_settings, apply_pipeline_optimizations
+        except ImportError as e:
+            print(f"Warning: Unified speed optimizer not available: {e}")
+            return pipeline
+        
+        # Get optimized settings from unified optimizer
+        settings = optimize_inference_settings(
+            inference_steps=getattr(self, 'inference_steps', 20),
+            batch_size=getattr(self, 'BATCH_SIZE', 8),
+            speed_mode=speed_mode,
+            quality_preset=quality_preset,
+            enable_deepcache=enable_deepcache,
+            gpu_info=self.gpu_config.gpu_info if hasattr(self, 'gpu_config') and self.gpu_config else None,
+            print_summary=True
+        )
+        
+        # Store the optimized settings
+        self.optimized_settings = settings
+        
+        # Apply optimizations to pipeline
+        return apply_pipeline_optimizations(pipeline, settings)
 
-    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced", memory_mode="balanced", enable_disk_cache=False, return_frames=True, output_mode="auto", attention_mode="flash"):
+    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced", memory_mode="balanced", enable_disk_cache=False, return_frames=True, output_mode="auto", attention_mode="flash", speed_mode="normal", quality_preset="auto", enable_deepcache=False, **kwargs):
         # Use our module temp directory
         global MODULE_TEMP_DIR
+        
+        # Get progress callback if provided by ComfyUI
+        progress_callback = kwargs.get('progress_cb', None)
+        
+        # Simple progress handler that works with ComfyUI
+        def update_progress(current, total, message="Processing..."):
+            if progress_callback:
+                try:
+                    progress = min(1.0, current / total if total > 0 else 0)
+                    progress_callback(progress, f"{message} ({current}/{total})")
+                except:
+                    pass  # Ignore callback errors
         
         # Initialize variables that might be used in error handlers
         total_frames = 0
@@ -494,17 +579,94 @@ class LatentSyncNode:
         # Get optimal settings from GPU config
         gpu_settings = self.gpu_config.get_optimal_settings(task="inference")
         
+        # Adjust inference steps based on speed mode and quality preset
+        original_inference_steps = inference_steps
+        
+        # Auto-optimize if quality preset is "auto"
+        if quality_preset == "auto":
+            try:
+                from .gpu_benchmark import GPUBenchmark
+                
+                # Check for cached benchmark results
+                benchmark = GPUBenchmark()
+                cached_settings = benchmark.load_cached_results()
+                
+                if cached_settings:
+                    # Estimate video length based on frames
+                    video_length = num_frames / 25.0  # Assuming 25 fps
+                    
+                    # Choose appropriate settings based on video length
+                    if video_length < 5:
+                        auto_settings = cached_settings.short_video
+                    elif video_length < 20:
+                        auto_settings = cached_settings.medium_video
+                    else:
+                        auto_settings = cached_settings.long_video
+                        
+                    # Apply auto settings if not already set
+                    if speed_mode == "normal":
+                        speed_mode = auto_settings["speed_mode"]
+                        print(f"🤖 Auto-selected speed mode: {speed_mode}")
+                    if not enable_deepcache and auto_settings.get("enable_deepcache", False):
+                        enable_deepcache = True
+                        print(f"🤖 Auto-enabled DeepCache")
+                        
+                    # Set quality preset based on auto settings
+                    quality_preset = auto_settings["quality_preset"]
+                    print(f"🤖 Auto-selected quality preset: {quality_preset}")
+                else:
+                    # No benchmark data, use conservative defaults
+                    quality_preset = "balanced"
+                    
+            except Exception as e:
+                print(f"Could not load auto-optimization settings: {e}")
+                quality_preset = "balanced"
+        
+        # Store original inference steps for reference
+        self.original_inference_steps = inference_steps
+        
+        # Step adjustments will be handled by unified optimizer in _apply_speed_optimizations
+        
         # Extract settings
         device = gpu_settings["device"]
         BATCH_SIZE = gpu_settings["batch_size"]
         use_mixed_precision = self.gpu_config.profile.use_mixed_precision
         enable_tf32 = self.gpu_config.profile.enable_tf32
         
-        # Override inference steps if user specified
-        if inference_steps != 20:  # If not default
-            gpu_settings["inference_steps"] = inference_steps
+        # Store speed optimization settings for later use with pipeline
+        self.speed_optimization_settings = {
+            'speed_mode': speed_mode,
+            'quality_preset': quality_preset,
+            'enable_deepcache': enable_deepcache
+        }
+        
+        # Store inference steps for optimizer
+        self.inference_steps = inference_steps
+        self.BATCH_SIZE = BATCH_SIZE
+        
+        # Dynamic memory monitoring and adjustment
+        if torch.cuda.is_available():
+            free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+            free_gb = free_memory / (1024**3)
+            
+            # Adjust batch size based on available memory
+            if free_gb < 4 and BATCH_SIZE > 8:
+                BATCH_SIZE = 8
+                print(f"⚠️ Low GPU memory ({free_gb:.1f}GB free), reducing batch size to {BATCH_SIZE}")
+            elif free_gb < 2 and BATCH_SIZE > 4:
+                BATCH_SIZE = 4
+                print(f"⚠️ Very low GPU memory ({free_gb:.1f}GB free), reducing batch size to {BATCH_SIZE}")
+                
+            gpu_settings["batch_size"] = BATCH_SIZE
+        
+        # Keep the original inference steps logic
+        original_steps = inference_steps
+        
+        # Override inference steps if user specified (unless using presets)
+        if original_steps != 20 and quality_preset == "auto":  # If not default and not using preset
+            inference_steps = original_steps
         else:
-            inference_steps = gpu_settings["inference_steps"]
+            gpu_settings["inference_steps"] = inference_steps
         
         # Log current settings
         print(f"\nUsing adaptive GPU settings:")
@@ -512,6 +674,9 @@ class LatentSyncNode:
         print(f"  Inference Steps: {inference_steps}")
         print(f"  VRAM Fraction: {self.gpu_config.profile.vram_fraction:.1%}")
         print(f"  Mixed Precision: {use_mixed_precision}")
+        print(f"  Speed Mode: {speed_mode}")
+        print(f"  Quality Preset: {quality_preset}")
+        print(f"  DeepCache: {'Enabled' if enable_deepcache else 'Disabled'}")
         
         # Clear GPU cache before processing
         if torch.cuda.is_available():
@@ -557,13 +722,22 @@ class LatentSyncNode:
             
             # Process input frames entirely on CPU to avoid unnecessary GPU
             # memory usage before inference
+            update_progress(2, 10, "Processing input frames...")
             if isinstance(images, list):
-                frames_cpu = torch.stack(images).cpu()
+                # Process in chunks to avoid large memory allocations
+                chunk_size = 100
+                frames_list = []
+                for i in range(0, len(images), chunk_size):
+                    chunk = torch.stack(images[i:i+chunk_size]).cpu()
+                    frames_list.append((chunk * 255).to(torch.uint8))
+                    del chunk
+                frames_uint8 = torch.cat(frames_list, dim=0)
+                del frames_list
             else:
                 frames_cpu = images.cpu()
-
-            frames_uint8 = (frames_cpu * 255).to(torch.uint8)
-            del frames_cpu
+                frames_uint8 = (frames_cpu * 255).to(torch.uint8)
+                del frames_cpu
+            
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -588,24 +762,23 @@ class LatentSyncNode:
                 "sample_rate": sample_rate
             }
             
-            # Move waveform to CPU for saving
+            # Move waveform to CPU for saving and immediately free GPU memory
             waveform_cpu = waveform.cpu()
+            del waveform  # Free GPU memory immediately
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
             torchaudio.save(audio_path, waveform_cpu, sample_rate)
             del waveform_cpu
             gc.collect()
 
             # Write video frames
+            update_progress(3, 10, "Writing video frames...")
             try:
-                import torchvision.io as io
-                io.write_video(temp_video_path, frames_uint8, fps=25, video_codec='h264')
-            except TypeError as e:
-                # Check if the error is specifically about macro_block_size
-                if "macro_block_size" in str(e):
-                    import imageio
-                    # Use imageio with macro_block_size parameter
-                    imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=25, codec='h264', macro_block_size=1)
-                else:
-                    # Fall back to original PyAV code for other TypeError issues
+                # First try imageio which is more reliable
+                import imageio
+                imageio.mimsave(temp_video_path, frames_uint8.cpu().numpy(), fps=25, codec='h264', macro_block_size=1)
+            except Exception as e:
+                # Fall back to PyAV if imageio fails
+                try:
                     import av
                     container = av.open(temp_video_path, mode='w')
                     stream = container.add_stream('h264', rate=25)
@@ -613,17 +786,30 @@ class LatentSyncNode:
                     stream.height = frames_uint8.shape[1]
 
                     for frame in frames_uint8:
-                        frame = av.VideoFrame.from_ndarray(frame.numpy(), format='rgb24')
+                        frame = av.VideoFrame.from_ndarray(frame.cpu().numpy(), format='rgb24')
                         packet = stream.encode(frame)
                         container.mux(packet)
 
                     packet = stream.encode(None)
                     container.mux(packet)
                     container.close()
+                except Exception as e2:
+                    # Last resort: try opencv
+                    import cv2
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(temp_video_path, fourcc, 25.0, 
+                                        (frames_uint8.shape[2], frames_uint8.shape[1]))
+                    for frame in frames_uint8:
+                        # Convert RGB to BGR for OpenCV
+                        bgr_frame = cv2.cvtColor(frame.cpu().numpy(), cv2.COLOR_RGB2BGR)
+                        out.write(bgr_frame)
+                    out.release()
 
             del frames_uint8
+            # Combine cleanup operations
             gc.collect()
-            clear_cache_periodically()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             log_memory_usage("After video encoding")
 
             # Define paths to required files and configs
@@ -652,16 +838,21 @@ class LatentSyncNode:
                 if hasattr(config.data, 'batch_size'):
                     config.data.batch_size = 1  # Keep at 1 for pipeline compatibility
 
-            # Set the correct mask image path
-            mask_image_path = os.path.join(cur_dir, "latentsync", "utils", "mask.png")
-            # Make sure the mask image exists
-            if not os.path.exists(mask_image_path):
-                # Try to find it in the utils directory directly
-                alt_mask_path = os.path.join(cur_dir, "utils", "mask.png")
-                if os.path.exists(alt_mask_path):
-                    mask_image_path = alt_mask_path
-                else:
-                    print(f"Warning: Could not find mask image at expected locations")
+            # Set the correct mask image path (use cached if available)
+            if 'mask_image_path' in self._cached_paths:
+                mask_image_path = self._cached_paths['mask_image_path']
+            else:
+                mask_image_path = os.path.join(cur_dir, "latentsync", "utils", "mask.png")
+                # Make sure the mask image exists
+                if not os.path.exists(mask_image_path):
+                    # Try to find it in the utils directory directly
+                    alt_mask_path = os.path.join(cur_dir, "utils", "mask.png")
+                    if os.path.exists(alt_mask_path):
+                        mask_image_path = alt_mask_path
+                    else:
+                        print(f"Warning: Could not find mask image at expected locations")
+                # Cache the path for future use
+                self._cached_paths['mask_image_path'] = mask_image_path
 
             # Set mask path in config
             if hasattr(config, "data") and hasattr(config.data, "mask_image_path"):
@@ -701,6 +892,7 @@ class LatentSyncNode:
             # Note: We no longer interfere with ComfyUI's temp directory
 
             # Import the inference module
+            update_progress(1, 10, "Loading inference module...")
             inference_module = import_inference_script(inference_script_path)
             
             # Monkey patch any temp directory functions in the inference module
@@ -711,8 +903,42 @@ class LatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
+            # Patch progress callback into pipeline if available
+            if hasattr(inference_module, 'pipeline') and progress_callback:
+                if hasattr(inference_module.pipeline, 'set_comfy_callback'):
+                    inference_module.pipeline.set_comfy_callback(progress_callback)
+                elif hasattr(inference_module.pipeline, 'set_progress_bar_config'):
+                    # Create a custom progress bar config that uses our callback
+                    inference_module.pipeline.set_progress_bar_config(
+                        callback=lambda step, total: update_progress(step, total, "Generating frames...")
+                    )
+            
             # Apply speed optimizations based on user preference and GPU capability
             print(f"Using optimization level: {optimization_level}")
+            
+            # Apply pipeline patches to prevent display lag
+            try:
+                from .pipeline_speed_patch import patch_lipsync_pipeline_for_speed
+                patch_lipsync_pipeline_for_speed()
+            except Exception as e:
+                print(f"Warning: Could not apply pipeline speed patches: {e}")
+            
+            # Display speed optimization summary
+            if speed_mode != "normal" or quality_preset != "auto" or enable_deepcache:
+                print("\n" + "="*60)
+                print("⚡ SPEED OPTIMIZATIONS ENABLED ⚡")
+                print("="*60)
+                print(f"Speed Mode: {speed_mode.upper()}")
+                print(f"Quality Preset: {quality_preset.upper()}")
+                print(f"DeepCache: {'ENABLED' if enable_deepcache else 'DISABLED'}")
+                print(f"Inference Steps: {inference_steps} (original: {self.original_inference_steps})")
+                expected_speedup = 1.0
+                if speed_mode == "fast": expected_speedup *= 1.5
+                elif speed_mode == "turbo": expected_speedup *= 2.0
+                elif speed_mode == "ultra": expected_speedup *= 3.0
+                if enable_deepcache: expected_speedup *= 1.5
+                print(f"Expected Speedup: ~{expected_speedup:.1f}x")
+                print("="*60 + "\n")
             
             if custom_vram is None or self.gpu_config.gpu_info["vram_gb"] < 12:
                 config, args = reduce_inference_lag(config, args)
@@ -729,11 +955,8 @@ class LatentSyncNode:
                     else:
                         args.batch_size = min(16, args.batch_size)  # Allow up to 16 for 4090 otherwise
                     
-                # Apply dynamic inference step reduction based on optimization level
-                if optimization_level != "conservative":
-                    original_steps = args.inference_steps
-                    args.inference_steps = dynamic_inference_steps(original_steps, optimization_level)
-                    print(f"Optimized inference steps: {original_steps} -> {args.inference_steps}")
+                # Step reduction is now handled by unified optimizer
+                pass
             
             # Log memory before inference
             log_memory_usage("Before inference")
@@ -795,13 +1018,116 @@ class LatentSyncNode:
                                     optimization_level
                                 )
                                 print(f"Applied speed optimizations: {speed_opts}")
+                            
+                            # Apply user-selected speed optimizations using stored settings
+                            if hasattr(self, 'speed_optimization_settings'):
+                                inference_module.pipeline = self._apply_speed_optimizations(
+                                    inference_module.pipeline,
+                                    speed_mode=self.speed_optimization_settings['speed_mode'],
+                                    quality_preset=self.speed_optimization_settings['quality_preset'],
+                                    enable_deepcache=self.speed_optimization_settings['enable_deepcache']
+                                )
+                                # Update args with optimized settings if available
+                                if hasattr(self, 'optimized_settings'):
+                                    args.inference_steps = self.optimized_settings['inference_steps']
+                                    args.batch_size = self.optimized_settings['batch_size']
+                                    print(f"Updated args with optimized settings: steps={args.inference_steps}, batch={args.batch_size}")
+                            else:
+                                # Fallback if settings weren't stored
+                                inference_module.pipeline = self._apply_speed_optimizations(
+                                    inference_module.pipeline,
+                                    speed_mode=speed_mode,
+                                    quality_preset=quality_preset,
+                                    enable_deepcache=enable_deepcache
+                                )
+                            
+                            # Apply additional advanced optimizations
+                            try:
+                                # 1. Enhanced torch.compile optimization
+                                from .compile_optimizer import optimize_pipeline_with_compile
+                                inference_module.pipeline = optimize_pipeline_with_compile(
+                                    inference_module.pipeline, 
+                                    self.gpu_config.gpu_info
+                                )
+                                
+                                # 2. Pipeline parallelism for overlapping operations
+                                if self.gpu_config.gpu_info.get("vram_gb", 0) >= 12:
+                                    from .pipeline_parallel import enable_pipeline_parallelism
+                                    inference_module.pipeline = enable_pipeline_parallelism(
+                                        inference_module.pipeline,
+                                        self.gpu_config.gpu_info
+                                    )
+                                
+                                # 3. Speculative execution for predictive processing
+                                if optimization_level == "aggressive" and self.gpu_config.gpu_info.get("vram_gb", 0) >= 16:
+                                    from .speculative_execution import enable_speculative_execution
+                                    speculative_executor = enable_speculative_execution(
+                                        inference_module.pipeline,
+                                        self.gpu_config.gpu_info
+                                    )
+                                    
+                                print("✨ All advanced optimizations applied successfully")
+                                
+                            except Exception as e:
+                                print(f"Some advanced optimizations could not be applied: {e}")
+                                # Continue without advanced optimizations
                         
                         # Use CUDA graphs for RTX 4090 with aggressive optimization
-                        if optimization_level == "aggressive" and "4090" in self.gpu_config.gpu_info["name"]:
-                            with cuda_graphs_context():
-                                inference_module.main(config, args)
-                        else:
-                            inference_module.main(config, args)
+                        print("[LatentSync] Starting main inference process...")
+                        update_progress(5, 10, "Starting inference...")
+                        
+                        # Thread-safe timeout implementation
+                        import threading
+                        import time
+                        
+                        # Set a generous timeout based on video length
+                        timeout_seconds = max(300, num_frames * 2)  # At least 5 minutes, or 2 seconds per frame
+                        
+                        # Create a wrapper to run inference with timeout
+                        inference_result = {'success': False, 'error': None}
+                        
+                        def run_inference():
+                            try:
+                                # Import throttling for display-friendly inference
+                                from .gpu_throttle import gpu_friendly_inference
+                                
+                                # Wrap inference to prevent display lag
+                                with gpu_friendly_inference(inference_module.main) as throttled_inference:
+                                    if optimization_level == "aggressive" and "4090" in self.gpu_config.gpu_info["name"]:
+                                        with cuda_graphs_context():
+                                            throttled_inference(config, args)
+                                    else:
+                                        throttled_inference(config, args)
+                                inference_result['success'] = True
+                            except Exception as e:
+                                inference_result['error'] = e
+                        
+                        # Run inference in a separate thread with timeout
+                        inference_thread = threading.Thread(target=run_inference)
+                        inference_thread.daemon = True
+                        inference_thread.start()
+                        
+                        # Wait for completion or timeout
+                        start_time = time.time()
+                        while inference_thread.is_alive():
+                            elapsed = time.time() - start_time
+                            if elapsed > timeout_seconds:
+                                print(f"[LatentSync] ERROR: Inference timed out after {timeout_seconds} seconds")
+                                # Note: We can't forcefully stop the thread, but we can return an error
+                                raise RuntimeError(f"Inference process timed out after {timeout_seconds} seconds. This might be due to insufficient GPU memory or a processing error.")
+                            
+                            # Update progress based on elapsed time
+                            progress_pct = min(0.9, elapsed / timeout_seconds)
+                            update_progress(5 + int(progress_pct * 4), 10, "Processing frames...")
+                            time.sleep(0.5)  # Check every 500ms
+                        
+                        # Check if inference was successful
+                        if not inference_result['success']:
+                            if inference_result['error']:
+                                print(f"[LatentSync] ERROR during inference: {str(inference_result['error'])}")
+                                raise inference_result['error']
+                            else:
+                                raise RuntimeError("Inference failed without specific error")
             finally:
                 # Stop GPU monitoring
                 gpu_monitor.stop()
@@ -1113,142 +1439,12 @@ class LatentSyncNode:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-# class VideoLengthAdjuster:
-#     @classmethod
-#     def INPUT_TYPES(s):
-#         return {
-#             "required": {
-#                 "images": ("IMAGE",),
-#                 "audio": ("AUDIO",),
-#                 "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
-#                 "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0}),
-#                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "step": 0.1}),
-#             }
-#         }
-# 
-#     CATEGORY = "LatentSyncNode"
-#     RETURN_TYPES = ("IMAGE", "AUDIO")
-#     RETURN_NAMES = ("images", "audio")
-#     FUNCTION = "adjust"
-# 
-#     def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5):
-#         waveform = audio["waveform"].squeeze(0)
-#         sample_rate = int(audio["sample_rate"])
-#         original_frames = [images[i] for i in range(images.shape[0])] if isinstance(images, torch.Tensor) else images.copy()
-# 
-#         if mode == "normal":
-#             # Add silent padding to the audio and then trim video to match
-#             audio_duration = waveform.shape[1] / sample_rate
-#             
-#             # Add silent padding to the audio
-#             silence_samples = math.ceil(silent_padding_sec * sample_rate)
-#             silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-#             padded_audio = torch.cat([waveform, silence], dim=1)
-#             
-#             # Calculate required frames based on the padded audio
-#             padded_audio_duration = (waveform.shape[1] + silence_samples) / sample_rate
-#             required_frames = int(padded_audio_duration * fps)
-#             
-#             if len(original_frames) > required_frames:
-#                 # Trim video frames to match padded audio duration
-#                 adjusted_frames = original_frames[:required_frames]
-#             else:
-#                 # If video is shorter than padded audio, keep all video frames
-#                 # and trim the audio accordingly
-#                 adjusted_frames = original_frames
-#                 required_samples = int(len(original_frames) / fps * sample_rate)
-#                 padded_audio = padded_audio[:, :required_samples]
-#             
-#             return (
-#                 torch.stack(adjusted_frames),
-#                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-#             )
-#             
-#             # This return statement is no longer needed as it's handled in the updated code
-# 
-#         elif mode == "pingpong":
-#             video_duration = len(original_frames) / fps
-#             audio_duration = waveform.shape[1] / sample_rate
-#             if audio_duration <= video_duration:
-#                 required_samples = int(video_duration * sample_rate)
-#                 silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
-#                 adjusted_audio = torch.cat([waveform, silence], dim=1)
-# 
-#                 return (
-#                     torch.stack(original_frames),
-#                     {"waveform": adjusted_audio.unsqueeze(0), "sample_rate": sample_rate}
-#                 )
-# 
-#             else:
-#                 silence_samples = math.ceil(silent_padding_sec * sample_rate)
-#                 silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-#                 padded_audio = torch.cat([waveform, silence], dim=1)
-#                 total_duration = (waveform.shape[1] + silence_samples) / sample_rate
-#                 target_frames = math.ceil(total_duration * fps)
-#                 reversed_frames = original_frames[::-1][1:-1]  # Remove endpoints
-#                 frames = original_frames + reversed_frames
-#                 while len(frames) < target_frames:
-#                     frames += frames[:target_frames - len(frames)]
-#                 return (
-#                     torch.stack(frames[:target_frames]),
-#                     {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-#                 )
-# 
-#         elif mode == "loop_to_audio":
-#             # Add silent padding then simple loop
-#             silence_samples = math.ceil(silent_padding_sec * sample_rate)
-#             silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-#             padded_audio = torch.cat([waveform, silence], dim=1)
-#             total_duration = (waveform.shape[1] + silence_samples) / sample_rate
-#             target_frames = math.ceil(total_duration * fps)
-# 
-#             frames = original_frames.copy()
-#             while len(frames) < target_frames:
-#                 frames += original_frames[:target_frames - len(frames)]
-#             
-#             return (
-#                 torch.stack(frames[:target_frames]),
-#                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-#             )
-# 
-# 
-# 
-class LatentSyncVideoPathNode(LatentSyncNode):
-    """A version of LatentSyncNode that returns video path instead of frames to avoid memory issues"""
-    
-    @classmethod
-    def INPUT_TYPES(s):
-        # Get parent inputs and modify for video path output
-        inputs = super().INPUT_TYPES()
-        # Remove return_frames and output_mode since we force them
-        if "return_frames" in inputs["required"]:
-            del inputs["required"]["return_frames"]
-        if "output_mode" in inputs["required"]:
-            del inputs["required"]["output_mode"]
-        return inputs
-    
-    RETURN_TYPES = ("STRING", "AUDIO")
-    RETURN_NAMES = ("video_path", "audio")
-    FUNCTION = "inference_path"
-    
-    def inference_path(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced", memory_mode="balanced", enable_disk_cache=False, output_mode="video_file"):
-        # Call parent inference with output_mode="video_file" to ensure we get a path
-        _, audio_output, video_path = super().inference(
-            images, audio, seed, lips_expression, inference_steps, 
-            vram_fraction, optimization_level, memory_mode, enable_disk_cache, 
-            return_frames=False, output_mode="video_file"
-        )
-        
-        return (video_path, audio_output)
-
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
     "LatentSyncNode": LatentSyncNode,
-    # Removed LatentSyncVideoPathNode - main node now outputs video_path directly
 }
 
 # Display Names for ComfyUI
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LatentSyncNode": "🎭 LatentSync 1.6 (MEMSAFE)",
-    # Removed redundant video path node
+    "LatentSyncNode": "🎭 LatentSync 1.6 (MEMSAFE+SPEED)",
 }

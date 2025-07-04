@@ -128,6 +128,24 @@ def main(config, args):
         unet=unet,
         scheduler=scheduler,
     ).to("cuda")
+    
+    # Apply progress bar fixes to the pipeline
+    try:
+        from comprehensive_progress_fix import patch_pipeline_instance
+        pipeline = patch_pipeline_instance(pipeline)
+        print("✓ Applied progress bar fixes to pipeline")
+    except:
+        # Try importing from parent directory
+        try:
+            import sys
+            parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            from comprehensive_progress_fix import patch_pipeline_instance
+            pipeline = patch_pipeline_instance(pipeline)
+            print("✓ Applied progress bar fixes to pipeline")
+        except Exception as e:
+            print(f"Warning: Could not patch pipeline progress bars: {e}")
 
     # DeepCache optimization disabled - using built-in optimizations instead
     # The pipeline now has built-in optimizations for speed

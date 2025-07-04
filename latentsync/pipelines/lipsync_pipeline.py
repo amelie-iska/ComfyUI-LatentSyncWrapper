@@ -30,6 +30,7 @@ from diffusers.utils import deprecate, logging
 
 from einops import rearrange
 import cv2
+import tqdm
 
 from ..models.unet import UNet3DConditionModel
 
@@ -58,7 +59,37 @@ except:
 from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
 from ..whisper.audio2feature import Audio2Feature
-import tqdm
+# Override tqdm before any imports
+class FakeTqdm:
+    def __init__(self, *args, **kwargs):
+        self.iterable = args[0] if args and hasattr(args[0], '__iter__') else None
+        
+    def __iter__(self):
+        if self.iterable:
+            return iter(self.iterable)
+        return iter([])
+        
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, *args):
+        pass
+        
+    def update(self, n=1):
+        pass
+        
+    def set_description(self, desc):
+        pass
+        
+    @classmethod
+    def tqdm(cls, *args, **kwargs):
+        return cls(*args, **kwargs)
+
+# Replace tqdm module
+import sys
+sys.modules['tqdm'] = FakeTqdm
+sys.modules['tqdm.auto'] = FakeTqdm
+
 import soundfile as sf
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -142,7 +173,12 @@ class LipsyncPipeline(DiffusionPipeline):
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
-        self.set_progress_bar_config(desc="Steps")
+        # Don't set progress bar config here - it creates blocking UI
+        # self.set_progress_bar_config(desc="Steps")
+        
+        # Completely disable progress bars
+        self._progress_bar_config = {'disable': True}
+        self._progress_bar = None
         
         # Compile critical functions for speed on supported GPUs
         # Can be disabled via DISABLE_TORCH_COMPILE=1 for PyTorch 2.7.1 compatibility
@@ -200,6 +236,12 @@ class LipsyncPipeline(DiffusionPipeline):
         decoded_chunks = []
         
         for i in range(0, latents.shape[0], batch_size):
+            # Yield to display before each VAE decode batch to prevent lag
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                import time
+                time.sleep(0.001)  # 1ms yield prevents display freezing
+                
             chunk = latents[i:i+batch_size]
             decoded_chunk = self.vae.decode(chunk).sample
             decoded_chunks.append(decoded_chunk)
@@ -297,9 +339,47 @@ class LipsyncPipeline(DiffusionPipeline):
         return image_latents
 
     def set_progress_bar_config(self, **kwargs):
+        # Override to prevent blocking progress bars
+        # Store config but don't create actual progress bar
         if not hasattr(self, "_progress_bar_config"):
             self._progress_bar_config = {}
         self._progress_bar_config.update(kwargs)
+        # Don't call parent's set_progress_bar_config to prevent tqdm creation
+    
+    @property
+    def progress_bar(self):
+        """Override progress_bar property to return a non-blocking version"""
+        # Return a dummy context manager that does nothing
+        from contextlib import contextmanager
+        
+        @contextmanager
+        def dummy_progress_bar(iterable=None, total=None, desc=None):
+            # If we have an iterable, just return it unchanged
+            if iterable is not None:
+                yield iterable
+            else:
+                # Return a simple range if total is provided
+                yield range(total) if total else []
+        
+        return dummy_progress_bar
+    
+    def __getattr__(self, name):
+        """Intercept progress bar access to prevent blocking"""
+        if name == "_progress_bar" or name == "progress_bar":
+            # Return a dummy that does nothing
+            from contextlib import contextmanager
+            
+            @contextmanager
+            def dummy(*args, **kwargs):
+                # If args[0] is an iterable, yield it
+                if args and hasattr(args[0], '__iter__'):
+                    yield args[0]
+                else:
+                    yield range(1)  # Dummy range
+            
+            return dummy
+        # Call parent's __getattr__ for other attributes
+        return super().__getattr__(name)
 
     @staticmethod
     def paste_surrounding_pixels_back(decoded_latents, pixel_values, masks, device, weight_dtype):
@@ -322,7 +402,7 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = []
         boxes = []
         affine_matrices = []
-        print(f"Affine transforming {len(video_frames)} faces...")
+        print(f"[LatentSync] Affine transforming {len(video_frames)} faces...")
         
         # Batch processing with adaptive sizing
         if hasattr(self, 'memory_optimizer') and self.memory_optimizer:
@@ -332,7 +412,7 @@ class LipsyncPipeline(DiffusionPipeline):
         num_frames = len(video_frames)
         
         # Process in batches with progress bar
-        with tqdm.tqdm(total=num_frames) as pbar:
+        with tqdm.tqdm(total=num_frames, desc="Processing faces") as pbar:
             for i in range(0, num_frames, batch_size):
                 batch_end = min(i + batch_size, num_frames)
                 batch_frames = video_frames[i:batch_end]
@@ -522,13 +602,17 @@ class LipsyncPipeline(DiffusionPipeline):
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
         self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
-        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
+        # Don't use blocking progress bar config
+        # self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
+        print(f"[LatentSync] Starting inference with {num_frames} frames")
+        print(f"[LatentSync] Sample frames: {num_frames}")
 
         # 1. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # 2. Check inputs
+        print(f"[LatentSync] Checking inputs...")
         self.check_inputs(height, width, callback_steps)
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
@@ -543,13 +627,17 @@ class LipsyncPipeline(DiffusionPipeline):
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
+        print(f"[LatentSync] Processing audio features...")
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
+        print(f"[LatentSync] Reading audio and video...")
         audio_samples = read_audio(audio_path)
         video_frames = read_video(video_path, use_decord=False)
 
+        print(f"[LatentSync] Processing faces - this may take a moment...")
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        print(f"[LatentSync] Face processing complete")
 
         # Instead of accumulating frames in memory, we'll write to disk
         import tempfile
@@ -606,28 +694,24 @@ class LipsyncPipeline(DiffusionPipeline):
         )
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
-        for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+        print(f"[LatentSync] Starting {num_inferences} inference iterations...")
+        for i in range(num_inferences):
+            print(f"\n[LatentSync] Inference iteration {i+1}/{num_inferences}")
             # Enhanced memory clearing to prevent end-stage lag
             progress = i / num_inferences
             
-            # Progressive memory clearing - more aggressive as we progress
-            if progress > 0.8:  # Last 20% of iterations
-                # Very aggressive clearing every iteration
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                import gc
-                gc.collect(2)  # Full collection
-            elif progress > 0.6:  # 60-80% through
-                # Moderate clearing every iteration
-                if i > 0:
-                    torch.cuda.empty_cache()
-                    import gc
-                    gc.collect()
-            elif i > 0 and i % 2 == 0:  # First 60%
-                # Normal clearing every 2 iterations
+            # Progressive memory clearing - less aggressive to prevent freezing
+            if progress > 0.9 and i % 2 == 0:  # Last 10% of iterations, every 2nd iteration
+                # Only clear cache, avoid synchronize which can freeze
                 torch.cuda.empty_cache()
                 import gc
                 gc.collect()
+            elif progress > 0.7 and i % 3 == 0:  # 70-90% through, every 3rd iteration
+                # Moderate clearing
+                torch.cuda.empty_cache()
+            elif i > 0 and i % 5 == 0:  # First 70%, every 5th iteration
+                # Light clearing
+                torch.cuda.empty_cache()
             if self.unet.add_audio_layer:
                 audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
@@ -690,50 +774,65 @@ class LipsyncPipeline(DiffusionPipeline):
 
             # 9. Denoising loop
             num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for j, t in enumerate(timesteps):
-                    # expand the latents if we are doing classifier free guidance
-                    unet_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            # Don't use nested progress bars - they cause UI blocking
+            for j, t in enumerate(timesteps):
+                # CRITICAL: Yield GPU to display to prevent system lag
+                if j > 0 and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    import time
+                    time.sleep(0.001)  # 1ms yield prevents display freezing
+                    
+                if j == 0:
+                    print(f"[LatentSync] Denoising steps: {num_inference_steps} (with display priority)")
+                
+                # expand the latents if we are doing classifier free guidance
+                unet_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
-                    unet_input = self.scheduler.scale_model_input(unet_input, t)
+                unet_input = self.scheduler.scale_model_input(unet_input, t)
 
-                    # concat latents, mask, masked_image_latents in the channel dimension
-                    unet_input = torch.cat(
-                        [unet_input, mask_latents, masked_image_latents, ref_latents], dim=1
-                    )
+                # concat latents, mask, masked_image_latents in the channel dimension
+                unet_input = torch.cat(
+                    [unet_input, mask_latents, masked_image_latents, ref_latents], dim=1
+                )
 
-                    # predict the noise residual with mixed precision for speed
-                    with autocast(enabled=torch.cuda.is_available()):
-                        # Apply custom attention processor if using FlexAttention
-                        if self.attention_processor and self.attention_mode == "flex":
-                            # Temporarily set the processor for this forward pass
-                            old_processor = getattr(self.unet, '_attention_processor', None)
-                            self.unet._attention_processor = self.attention_processor
-                            
-                        noise_pred = self.unet(
-                            unet_input, t, encoder_hidden_states=audio_embeds
-                        ).sample
+                # predict the noise residual with mixed precision for speed
+                with autocast(enabled=torch.cuda.is_available(), dtype=torch.float16):
+                    # Apply custom attention processor if using FlexAttention
+                    if self.attention_processor and self.attention_mode == "flex":
+                        # Temporarily set the processor for this forward pass
+                        old_processor = getattr(self.unet, '_attention_processor', None)
+                        self.unet._attention_processor = self.attention_processor
                         
-                        # Restore old processor if changed
-                        if self.attention_processor and self.attention_mode == "flex":
-                            if old_processor is not None:
-                                self.unet._attention_processor = old_processor
-                            elif hasattr(self.unet, '_attention_processor'):
-                                del self.unet._attention_processor
+                    noise_pred = self.unet(
+                        unet_input, t, encoder_hidden_states=audio_embeds
+                    ).sample
+                    
+                    # Restore old processor if changed
+                    if self.attention_processor and self.attention_mode == "flex":
+                        if old_processor is not None:
+                            self.unet._attention_processor = old_processor
+                        elif hasattr(self.unet, '_attention_processor'):
+                            del self.unet._attention_processor
 
-                    # perform guidance
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
 
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                
+                # Yield to display after each step to maintain responsiveness
+                if torch.cuda.is_available() and j % 2 == 0:
+                    torch.cuda.synchronize()
+                    import time
+                    time.sleep(0.0005)  # 0.5ms micro-yield
 
-                    # call the callback, if provided
-                    if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and j % callback_steps == 0:
-                            callback(j, t, latents)
+                # call the callback, if provided
+                if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
+                    # Don't update progress_bar since we removed it
+                    if callback is not None and j % callback_steps == 0:
+                        callback(j, t, latents)
 
             # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
@@ -842,10 +941,17 @@ class LipsyncPipeline(DiffusionPipeline):
             
             for cmd, encoder_name in encoders:
                 try:
-                    subprocess.run(cmd, check=True, capture_output=True)
+                    # Add timeout to prevent hanging
+                    result = subprocess.run(cmd, check=True, capture_output=True, timeout=300)  # 5 minute timeout
                     print(f"Video encoded successfully with {encoder_name}")
                     break
-                except subprocess.CalledProcessError:
+                except subprocess.TimeoutExpired:
+                    print(f"Video encoding with {encoder_name} timed out after 5 minutes")
+                    if encoder_name == "libx264":
+                        raise RuntimeError("Video encoding timed out")
+                    continue  # Try next encoder
+                except subprocess.CalledProcessError as e:
+                    print(f"Video encoding failed with {encoder_name}: {e.stderr.decode() if e.stderr else 'Unknown error'}")
                     if encoder_name == "libx264":
                         raise  # Re-raise if software encoder fails
                     continue  # Try next encoder
@@ -861,7 +967,12 @@ class LipsyncPipeline(DiffusionPipeline):
                 "-c:a", "aac", "-q:v", "0", "-q:a", "0",
                 video_out_path
             ]
-            subprocess.run(command, check=True)
+            try:
+                subprocess.run(command, check=True, timeout=300)  # 5 minute timeout
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("Audio/video muxing timed out after 5 minutes")
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Audio/video muxing failed: {e.stderr.decode() if e.stderr else 'Unknown error'}")
         finally:
             # Always clean up temporary directories
             if os.path.exists(temp_output_dir):
