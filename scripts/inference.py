@@ -8,7 +8,7 @@ from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
-from DeepCache import DeepCacheSDHelper
+# DeepCache import removed - using local implementation instead
 import gc
 
 
@@ -129,10 +129,8 @@ def main(config, args):
         scheduler=scheduler,
     ).to("cuda")
 
-    # use DeepCache
-    helper = DeepCacheSDHelper(pipe=pipeline)
-    helper.set_params(cache_interval=3, cache_branch_id=0)
-    helper.enable()
+    # DeepCache optimization disabled - using built-in optimizations instead
+    # The pipeline now has built-in optimizations for speed
 
     if args.seed != -1:
         set_seed(args.seed)
@@ -141,22 +139,29 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
-    pipeline(
-        video_path=args.video_path,
-        audio_path=args.audio_path,
-        video_out_path=args.video_out_path,
-        video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
-        num_frames=config.data.num_frames,
-        num_inference_steps=args.inference_steps,
-        guidance_scale=args.guidance_scale,
-        weight_dtype=dtype,
-        width=config.data.resolution,
-        height=config.data.resolution,
-        mask_image_path=config.data.mask_image_path,
-    )
+    # Pass attention mode if provided
+    pipeline_kwargs = {
+        "video_path": args.video_path,
+        "audio_path": args.audio_path,
+        "video_out_path": args.video_out_path,
+        "video_mask_path": args.video_out_path.replace(".mp4", "_mask.mp4"),
+        "num_frames": config.data.num_frames,
+        "num_inference_steps": args.inference_steps,
+        "guidance_scale": args.guidance_scale,
+        "weight_dtype": dtype,
+        "width": config.data.resolution,
+        "height": config.data.resolution,
+        "mask_image_path": config.data.mask_image_path,
+    }
+    
+    # Add attention mode if provided
+    if hasattr(args, 'attention_mode'):
+        pipeline_kwargs['attention_mode'] = args.attention_mode
+    
+    pipeline(**pipeline_kwargs)
 
     # Explicitly free models to release GPU memory
-    del pipeline, unet, vae, audio_encoder, helper, scheduler
+    del pipeline, unet, vae, audio_encoder, scheduler
     torch.cuda.empty_cache()
     gc.collect()
 

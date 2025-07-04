@@ -1,13 +1,58 @@
-diffusers
-mediapipe>=0.10.8
-transformers
-huggingface-hub>=0.10.0
-omegaconf
-einops
-opencv-python
-face-alignment
-decord
+# Core dependencies for ComfyUI LatentSync 1.6 (MEMSAFE)
+# Install in ComfyUI environment: pip install -r requirements.txt
+
+# Note: ComfyUI typically includes PyTorch, but we need specific versions for attention optimizations
+# - Flash Attention: Works with PyTorch 2.0+ via xformers
+# - Flex Attention: Requires PyTorch 2.5+ (will fallback gracefully if not available)
+
+# Model and pipeline dependencies
+diffusers>=0.24.0
+transformers>=4.25.0
+accelerate>=0.20.0
+safetensors>=0.4.0
+huggingface-hub>=0.16.0
+omegaconf>=2.3.0
+einops>=0.6.0
+
+# Video processing
+opencv-python>=4.5.0
 ffmpeg-python>=0.2.0
-safetensors
-soundfile
-DeepCache
+imageio>=2.25.0
+imageio-ffmpeg>=0.4.8
+decord>=0.6.0  # For efficient video reading
+
+# Audio processing
+soundfile>=0.12.0
+librosa>=0.10.0
+openai-whisper>=20230314  # For Whisper audio encoder
+
+# Face processing
+mediapipe>=0.10.8
+face-alignment>=1.3.5
+
+# Lightning (for training scripts)
+pytorch-lightning>=2.0.0
+
+# Memory management
+psutil>=5.9.0
+GPUtil>=1.4.0  # For GPU monitoring
+
+# Attention optimizations
+xformers>=0.0.22  # For Flash Attention - HIGHLY RECOMMENDED for memory efficiency
+# flash-attn>=2.3.0  # Alternative to xformers (requires compilation)
+
+# Utilities
+requests>=2.28.0
+tqdm>=4.65.0
+pyyaml>=6.0
+Pillow>=9.0.0
+lz4>=4.3.2  # For compression in novel optimizations
+numpy<2.0.0  # Compatibility with older PyTorch versions
+
+# Optional: For FlexAttention support (requires PyTorch 2.5+):
+# First upgrade PyTorch:
+# pip install torch>=2.5.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Then FlexAttention will automatically be available
+
+# Optional: For better progress display in ComfyUI
+# rich>=13.0.0  # Enhanced terminal output

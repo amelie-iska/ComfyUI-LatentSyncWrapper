@@ -15,6 +15,11 @@ from .adaptive_gpu_config import AdaptiveGPUConfig, auto_configure_gpu
 from .speed_optimizer import apply_speed_optimizations, dynamic_inference_steps, cuda_graphs_context, DeepCacheOptimizer
 from .long_video_handler import LongVideoHandler, VideoLengthAdjuster, ProgressiveVideoProcessor
 from .memory_optimizer import InferenceMemoryOptimizer, FrameBufferManager, optimize_end_stage_inference
+try:
+    from .adaptive_memory_optimizer import create_adaptive_optimizer, integrate_adaptive_optimizer
+    ADAPTIVE_MEMORY_AVAILABLE = True
+except ImportError:
+    ADAPTIVE_MEMORY_AVAILABLE = False
 
 # Apply GPU memory limit immediately after importing
 limit_gpu_memory()
@@ -444,6 +449,7 @@ class LatentSyncNode:
                     "enable_disk_cache": ("BOOLEAN", {"default": False}),
                     "return_frames": ("BOOLEAN", {"default": False, "description": "Return frames (True) or video path (False)"}),
                     "output_mode": (["auto", "video_file", "frames"], {"default": "auto", "description": "auto: choose based on video length"}),
+                    "attention_mode": (["flash", "flex", "xformers", "standard"], {"default": "flash", "description": "Attention mechanism to use"}),
                  },}
 
     CATEGORY = "LatentSyncNode"
@@ -463,7 +469,7 @@ class LatentSyncNode:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
 
-    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced", memory_mode="balanced", enable_disk_cache=False, return_frames=True, output_mode="auto"):
+    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced", memory_mode="balanced", enable_disk_cache=False, return_frames=True, output_mode="auto", attention_mode="flash"):
         # Use our module temp directory
         global MODULE_TEMP_DIR
         
@@ -677,7 +683,8 @@ class LatentSyncNode:
                 use_mixed_precision=use_mixed_precision,
                 temp_dir=temp_dir,
                 mask_image_path=mask_image_path,
-                enable_optimizations=self.gpu_config.profile.enable_optimizations
+                enable_optimizations=self.gpu_config.profile.enable_optimizations,
+                attention_mode=attention_mode  # Pass attention mode to pipeline
             )
 
             # Set PYTHONPATH to include our directories 
@@ -741,6 +748,18 @@ class LatentSyncNode:
                 memory_mode=memory_mode,
                 enable_disk_cache=enable_disk_cache
             )
+            
+            # Apply adaptive memory optimization if available
+            if ADAPTIVE_MEMORY_AVAILABLE and hasattr(inference_module, 'pipeline'):
+                try:
+                    inference_module.pipeline = integrate_adaptive_optimizer(
+                        inference_module.pipeline,
+                        video_length=num_frames,
+                        resolution=(width, height)
+                    )
+                    print("✓ Adaptive memory optimization applied to pipeline")
+                except Exception as e:
+                    print(f"Could not apply adaptive optimization: {e}")
             
             # Calculate total iterations for optimization
             total_iterations = int(num_frames / 25.0 * inference_steps)  # Approximate
@@ -937,14 +956,29 @@ class LatentSyncNode:
             else:
                 # Original batched loading for smaller videos
                 # Improvement: Dynamic batch size based on available memory
-                if torch.cuda.is_available():
-                    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
-                    # Estimate batch size: ~100MB per frame at 512x512
-                    frame_size_mb = (width * height * 3 * 4) / (1024**2)
-                    safe_batch_size = int((free_gb * 1024 * 0.5) / frame_size_mb)  # Use 50% of free memory
-                    batch_size = min(max(safe_batch_size, 10), 100)  # Between 10-100 frames
+                if ADAPTIVE_MEMORY_AVAILABLE:
+                    try:
+                        adaptive_opt = create_adaptive_optimizer()
+                        batch_size = adaptive_opt.get_optimal_batch_size('frame_loading')
+                        print(f"Using adaptive batch size: {batch_size} frames")
+                    except:
+                        # Fallback to original calculation
+                        if torch.cuda.is_available():
+                            free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                            frame_size_mb = (width * height * 3 * 4) / (1024**2)
+                            safe_batch_size = int((free_gb * 1024 * 0.5) / frame_size_mb)
+                            batch_size = min(max(safe_batch_size, 10), 100)
+                        else:
+                            batch_size = 50
                 else:
-                    batch_size = 50  # Default for CPU
+                    # Original calculation
+                    if torch.cuda.is_available():
+                        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                        frame_size_mb = (width * height * 3 * 4) / (1024**2)
+                        safe_batch_size = int((free_gb * 1024 * 0.5) / frame_size_mb)
+                        batch_size = min(max(safe_batch_size, 10), 100)
+                    else:
+                        batch_size = 50
                 
                 print(f"Using batch size: {batch_size} frames")
                 processed_frames_list = []
