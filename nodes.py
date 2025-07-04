@@ -4,6 +4,7 @@ import torchaudio
 import uuid
 import sys
 import shutil
+import time
 from collections.abc import Mapping
 from datetime import datetime
 import gc
@@ -12,6 +13,8 @@ from .inference_optimizer import optimized_inference_context, optimize_inference
 from .gpu_monitor import gpu_monitor
 from .adaptive_gpu_config import AdaptiveGPUConfig, auto_configure_gpu
 from .speed_optimizer import apply_speed_optimizations, dynamic_inference_steps, cuda_graphs_context, DeepCacheOptimizer
+from .long_video_handler import LongVideoHandler, VideoLengthAdjuster, ProgressiveVideoProcessor
+from .memory_optimizer import InferenceMemoryOptimizer, FrameBufferManager, optimize_end_stage_inference
 
 # Apply GPU memory limit immediately after importing
 limit_gpu_memory()
@@ -47,48 +50,33 @@ def get_comfyui_temp_dir():
 
 # Function to clean up any ComfyUI temp directories
 def cleanup_comfyui_temp_directories():
-    """Find and clean up any ComfyUI temp directories"""
-    comfyui_temp = get_comfyui_temp_dir()
-    if not comfyui_temp:
-        print("Could not locate ComfyUI temp directory")
-        return
-    
-    comfyui_base = os.path.dirname(comfyui_temp)
-    
-    # Check for the main temp directory
-    if os.path.exists(comfyui_temp):
+    """Clean up only our LatentSync temp directories, not ComfyUI's main temp"""
+    # Only clean up our module's temp directory, not ComfyUI's
+    global MODULE_TEMP_DIR
+    if 'MODULE_TEMP_DIR' in globals() and MODULE_TEMP_DIR and os.path.exists(MODULE_TEMP_DIR):
         try:
-            shutil.rmtree(comfyui_temp)
-            print(f"Removed ComfyUI temp directory: {comfyui_temp}")
+            # Only clean old run directories inside our temp
+            for item in os.listdir(MODULE_TEMP_DIR):
+                item_path = os.path.join(MODULE_TEMP_DIR, item)
+                if os.path.isdir(item_path) and item.startswith("run_"):
+                    try:
+                        # Only remove if older than 1 hour
+                        stat = os.stat(item_path)
+                        age_hours = (time.time() - stat.st_mtime) / 3600
+                        if age_hours > 1:
+                            shutil.rmtree(item_path)
+                            print(f"Cleaned old LatentSync temp: {item}")
+                    except Exception as e:
+                        # Silently skip directories in use
+                        pass
         except Exception as e:
-            print(f"Could not remove {comfyui_temp}: {str(e)}")
-            # If we can't remove it, try to rename it
-            try:
-                backup_name = f"{comfyui_temp}_backup_{uuid.uuid4().hex[:8]}"
-                os.rename(comfyui_temp, backup_name)
-                print(f"Renamed {comfyui_temp} to {backup_name}")
-            except:
-                pass
-    
-    # Find and clean up any backup temp directories
-    try:
-        all_directories = [d for d in os.listdir(comfyui_base) if os.path.isdir(os.path.join(comfyui_base, d))]
-        for dirname in all_directories:
-            if dirname.startswith("temp_backup_"):
-                backup_path = os.path.join(comfyui_base, dirname)
-                try:
-                    shutil.rmtree(backup_path)
-                    print(f"Removed backup temp directory: {backup_path}")
-                except Exception as e:
-                    print(f"Could not remove backup dir {backup_path}: {str(e)}")
-    except Exception as e:
-        print(f"Error cleaning up temp directories: {str(e)}")
+            # Don't fail if cleanup doesn't work
+            pass
 
 # Create a module-level function to set up system-wide temp directory
 def init_temp_directories():
     """Initialize global temporary directory settings"""
-    # First clean up any existing temp directories
-    cleanup_comfyui_temp_directories()
+    # Don't call cleanup here as MODULE_TEMP_DIR doesn't exist yet
     
     # Generate a unique base directory for this module
     system_temp = tempfile.gettempdir()
@@ -104,26 +92,8 @@ def init_temp_directories():
     # Force Python's tempfile module to use our directory
     tempfile.tempdir = temp_base_path
     
-    # Final check for ComfyUI temp directory
-    comfyui_temp = get_comfyui_temp_dir()
-    if comfyui_temp and os.path.exists(comfyui_temp):
-        try:
-            shutil.rmtree(comfyui_temp)
-            print(f"Removed ComfyUI temp directory: {comfyui_temp}")
-        except Exception as e:
-            print(f"Could not remove {comfyui_temp}, trying to rename: {str(e)}")
-            try:
-                backup_name = f"{comfyui_temp}_backup_{unique_id}"
-                os.rename(comfyui_temp, backup_name)
-                print(f"Renamed {comfyui_temp} to {backup_name}")
-                # Try to remove the renamed directory as well
-                try:
-                    shutil.rmtree(backup_name)
-                    print(f"Removed renamed temp directory: {backup_name}")
-                except:
-                    pass
-            except:
-                print(f"Failed to rename {comfyui_temp}")
+    # Note: We no longer interfere with ComfyUI's temp directory
+    # This was causing conflicts with other nodes
     
     print(f"Set up system temp directory: {temp_base_path}")
     return temp_base_path
@@ -146,6 +116,9 @@ def module_cleanup():
 
 # Call this before anything else
 MODULE_TEMP_DIR = init_temp_directories()
+
+# Now we can safely clean up old temp directories
+cleanup_comfyui_temp_directories()
 
 # Register the cleanup handler to run when Python exits
 import atexit
@@ -228,6 +201,12 @@ def check_and_install_dependencies():
     if not check_ffmpeg():
         raise RuntimeError("FFmpeg is required but not found")
 
+    # Check if auto-install is disabled via environment variable
+    if os.environ.get("LATENTSYNC_NO_AUTO_INSTALL", "").lower() in ["true", "1", "yes"]:
+        print("Auto-installation disabled. Please install dependencies manually:")
+        print("pip install omegaconf pytorch_lightning transformers accelerate huggingface_hub einops diffusers ffmpeg-python")
+        return
+
     required_packages = [
         'omegaconf',
         'pytorch_lightning',
@@ -268,13 +247,17 @@ def check_and_install_dependencies():
             missing_packages.append(package)
     
     if missing_packages:
-        print(f"Installing missing dependencies: {', '.join(missing_packages)}")
+        print(f"Missing dependencies detected: {', '.join(missing_packages)}")
+        print("Attempting automatic installation...")
+        print("To disable auto-install, set environment variable: LATENTSYNC_NO_AUTO_INSTALL=true")
+        
         for package in missing_packages:
             try:
                 install_package(package)
             except Exception as e:
-                print(f"Warning: Failed to install {package}: {str(e)}")
-                raise
+                print(f"Error: Failed to install {package}: {str(e)}")
+                print(f"Please install manually: pip install {package}")
+                raise RuntimeError(f"Required package '{package}' is not installed")
     else:
         print("All dependencies are already installed")
     
@@ -438,14 +421,8 @@ class LatentSyncNode:
         if not os.path.exists(MODULE_TEMP_DIR):
             os.makedirs(MODULE_TEMP_DIR, exist_ok=True)
         
-        # Ensure ComfyUI temp doesn't exist
-        comfyui_temp = "D:\\ComfyUI_windows\\temp"
-        if os.path.exists(comfyui_temp):
-            backup_name = f"{comfyui_temp}_backup_{uuid.uuid4().hex[:8]}"
-            try:
-                os.rename(comfyui_temp, backup_name)
-            except:
-                pass
+        # Note: We no longer interfere with ComfyUI's temp directory
+        # This was causing conflicts with other nodes
         
         check_and_install_dependencies()
         setup_models()
@@ -463,12 +440,16 @@ class LatentSyncNode:
                     "inference_steps": ("INT", {"default": 20, "min": 1, "max": 999, "step": 1}),
                     "vram_fraction": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.95, "step": 0.05, "display": "slider"}),
                     "optimization_level": (["conservative", "balanced", "aggressive"], {"default": "balanced"}),
+                    "memory_mode": (["aggressive", "balanced", "conservative"], {"default": "balanced"}),
+                    "enable_disk_cache": ("BOOLEAN", {"default": False}),
+                    "return_frames": ("BOOLEAN", {"default": False, "description": "Return frames (True) or video path (False)"}),
+                    "output_mode": (["auto", "video_file", "frames"], {"default": "auto", "description": "auto: choose based on video length"}),
                  },}
 
     CATEGORY = "LatentSyncNode"
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio") 
+    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
+    RETURN_NAMES = ("images", "audio", "video_path") 
     FUNCTION = "inference"
 
     def process_batch(self, batch, use_mixed_precision=False):
@@ -482,9 +463,17 @@ class LatentSyncNode:
                 processed_batch = processed_batch[..., :3]
             return processed_batch
 
-    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced"):
+    def inference(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced", memory_mode="balanced", enable_disk_cache=False, return_frames=True, output_mode="auto"):
         # Use our module temp directory
         global MODULE_TEMP_DIR
+        
+        # Initialize variables that might be used in error handlers
+        total_frames = 0
+        width = 0
+        height = 0
+        estimated_memory = 0.0
+        free_memory = 0.0
+        should_return_frames = return_frames  # Initialize early for finally block
         
         # Initialize adaptive GPU configuration
         # Use custom vram_fraction if set (0.0 means auto)
@@ -527,16 +516,13 @@ class LatentSyncNode:
         # Create a run-specific subdirectory in our temp directory
         run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
         temp_dir = os.path.join(MODULE_TEMP_DIR, f"run_{run_id}")
+        # Ensure temp_dir is within our module directory (prevent path traversal)
+        temp_dir = os.path.abspath(temp_dir)
+        if not temp_dir.startswith(os.path.abspath(MODULE_TEMP_DIR)):
+            raise ValueError("Invalid temp directory path")
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Ensure ComfyUI temp doesn't exist again (in case something recreated it)
-        comfyui_temp = "D:\\ComfyUI_windows\\temp"
-        if os.path.exists(comfyui_temp):
-            backup_name = f"{comfyui_temp}_backup_{uuid.uuid4().hex[:8]}"
-            try:
-                os.rename(comfyui_temp, backup_name)
-            except:
-                pass
+        # Note: We no longer interfere with ComfyUI's temp directory
         
         temp_video_path = None
         output_video_path = None
@@ -550,6 +536,18 @@ class LatentSyncNode:
             
             # Get the extension directory
             cur_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # Check if we should use disk-based processing for long videos
+            num_frames = len(images) if isinstance(images, list) else images.shape[0]
+            use_disk_processing = False
+            long_video_handler = None
+            
+            if enable_disk_cache and memory_mode != "aggressive":
+                long_video_handler = LongVideoHandler(temp_dir, memory_mode)
+                use_disk_processing = long_video_handler.should_use_disk_processing(num_frames)
+                
+                if use_disk_processing:
+                    print(f"Using disk-based processing for {num_frames} frames (memory_mode: {memory_mode})")
             
             # Process input frames entirely on CPU to avoid unnecessary GPU
             # memory usage before inference
@@ -578,9 +576,9 @@ class LatentSyncNode:
                 waveform_16k = resampler(waveform)
                 waveform, sample_rate = waveform_16k, new_sample_rate
 
-            # Package resampled audio
+            # Package resampled audio (ensure waveform is on CPU)
             resampled_audio = {
-                "waveform": waveform.unsqueeze(0),
+                "waveform": waveform.unsqueeze(0).cpu(),
                 "sample_rate": sample_rate
             }
             
@@ -693,12 +691,7 @@ class LatentSyncNode:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 
-            # Check and prevent ComfyUI temp creation again
-            if os.path.exists(comfyui_temp):
-                try:
-                    os.rename(comfyui_temp, f"{comfyui_temp}_backup_{uuid.uuid4().hex[:8]}")
-                except:
-                    pass
+            # Note: We no longer interfere with ComfyUI's temp directory
 
             # Import the inference module
             inference_module = import_inference_script(inference_script_path)
@@ -738,6 +731,20 @@ class LatentSyncNode:
             # Log memory before inference
             log_memory_usage("Before inference")
             
+            # Improvement: Add estimated processing time
+            if num_frames > 100:
+                estimated_time = (num_frames / 25.0) * 2  # Rough estimate: 2x realtime
+                print(f"Estimated processing time: {estimated_time:.1f} seconds for {num_frames} frames")
+            
+            # Initialize memory optimizer for end-stage lag prevention
+            memory_optimizer = InferenceMemoryOptimizer(
+                memory_mode=memory_mode,
+                enable_disk_cache=enable_disk_cache
+            )
+            
+            # Calculate total iterations for optimization
+            total_iterations = int(num_frames / 25.0 * inference_steps)  # Approximate
+            
             # Start GPU monitoring to diagnose lag
             gpu_monitor.start()
             
@@ -751,6 +758,14 @@ class LatentSyncNode:
                             inference_module.pipeline = optimize_inference_pipeline(
                                 inference_module.pipeline, 
                                 enable_optimizations=optimizations
+                            )
+                            
+                            # Apply end-stage optimization to prevent lag
+                            inference_module.pipeline = optimize_end_stage_inference(
+                                inference_module.pipeline,
+                                num_iterations=total_iterations,
+                                memory_mode=memory_mode,
+                                enable_disk_cache=enable_disk_cache
                             )
                             
                             # Apply additional speed optimizations for high-end GPUs
@@ -781,6 +796,8 @@ class LatentSyncNode:
                 if hasattr(inference_module.pipeline, 'audio_encoder'):
                     del inference_module.pipeline.audio_encoder
                 del inference_module.pipeline
+            # Fix: Delete the inference_module itself to prevent memory leak
+            del inference_module
 
             # Force cleanup
             gc.collect()
@@ -795,19 +812,236 @@ class LatentSyncNode:
             if not os.path.exists(output_video_path):
                 raise FileNotFoundError(f"Output video not found at: {output_video_path}")
             
-            # Read the processed video - ensure it's loaded as CPU tensor
-            processed_frames = io.read_video(output_video_path, pts_unit='sec')[0]
-            processed_frames = processed_frames.float() / 255.0
-
-            # Ensure audio is on CPU before returning
+            # Determine output mode
+            should_return_frames = return_frames  # Default to user setting
+            
+            # Auto mode logic
+            if output_mode == "auto":
+                # Get video info to determine frame count
+                import ffmpeg
+                probe = ffmpeg.probe(output_video_path)
+                video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+                total_frames = int(video_info['nb_frames'])
+                
+                # Auto threshold based on memory mode
+                frame_thresholds = {
+                    "aggressive": 300,
+                    "balanced": 200, 
+                    "conservative": 100
+                }
+                threshold = frame_thresholds.get(memory_mode, 200)
+                
+                # If video is too long, force file mode
+                if total_frames > threshold:
+                    print(f"Auto mode: Video has {total_frames} frames (>{threshold}), returning video file")
+                    should_return_frames = False
+                else:
+                    print(f"Auto mode: Video has {total_frames} frames (<={threshold}), returning frames")
+                    should_return_frames = True
+            elif output_mode == "video_file":
+                should_return_frames = False
+            elif output_mode == "frames":
+                should_return_frames = True
+                
+            # If not returning frames, create a permanent copy and return just the path
+            if not should_return_frames:
+                # Create a permanent output location
+                output_dir = os.path.join(get_ext_dir(), "outputs")
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # Generate a unique filename for the permanent output
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                # Sanitize filename to prevent path injection
+                safe_timestamp = "".join(c for c in timestamp if c.isalnum() or c == "_")
+                permanent_output_path = os.path.join(output_dir, f"latentsync_output_{safe_timestamp}.mp4")
+                # Ensure output path is within output directory
+                permanent_output_path = os.path.abspath(permanent_output_path)
+                if not permanent_output_path.startswith(os.path.abspath(output_dir)):
+                    raise ValueError("Invalid output path")
+                
+                # Copy the output file to the permanent location
+                shutil.copy2(output_video_path, permanent_output_path)
+                
+                print(f"Video saved to: {permanent_output_path}")
+                
+                # Return empty tensor for frames and the path as a string
+                empty_frames = torch.zeros(1, 1, 1, 3).cpu()  # Minimal tensor on CPU
+                
+                return (empty_frames, resampled_audio, permanent_output_path)
+            
+            # Read the processed video with memory-efficient batching
+            print("Loading processed video frames...")
+            
+            # Use ffmpeg-python to get video info first
+            import ffmpeg
+            probe = ffmpeg.probe(output_video_path)
+            video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            total_frames = int(video_info['nb_frames'])
+            width = int(video_info['width'])
+            height = int(video_info['height'])
+            
+            # Improvement: Pre-check memory requirements
             if torch.cuda.is_available():
-                if hasattr(resampled_audio["waveform"], 'device') and resampled_audio["waveform"].device.type == 'cuda':
-                    resampled_audio["waveform"] = resampled_audio["waveform"].cpu()
-                if hasattr(processed_frames, 'device') and processed_frames.device.type == 'cuda':
+                free_memory = torch.cuda.mem_get_info()[0] / 1024**3  # GB
+                estimated_memory = (total_frames * width * height * 3 * 4) / 1024**3  # GB (float32)
+                if estimated_memory > free_memory * 0.8:
+                    print(f"Warning: Video requires ~{estimated_memory:.1f}GB but only {free_memory:.1f}GB available")
+                    print("Automatically switching to disk-based loading...")
+            
+            # Check if we should use disk-based loading for large videos
+            use_disk_loading = False
+            # Improvement: Auto-enable disk loading if memory is tight
+            if torch.cuda.is_available() and 'estimated_memory' in locals() and 'free_memory' in locals() and estimated_memory > free_memory * 0.8:
+                use_disk_loading = True
+            elif total_frames > 200 or (enable_disk_cache and memory_mode == "conservative"):
+                use_disk_loading = True
+                print(f"Using disk-based frame loading for {total_frames} frames")
+            
+            # Initialize long_video_handler if needed for output loading
+            if use_disk_loading and not long_video_handler:
+                long_video_handler = LongVideoHandler(temp_dir, memory_mode)
+            
+            if use_disk_loading and long_video_handler:
+                # Use LongVideoHandler for disk-based loading
+                frame_dir, metadata = long_video_handler.extract_frames_to_disk(output_video_path)
+                
+                # Determine optimal batch size based on memory mode
+                batch_sizes = {
+                    "aggressive": 32,
+                    "balanced": 16,
+                    "conservative": 8
+                }
+                batch_size = batch_sizes.get(memory_mode, 16)
+                
+                processed_frames_list = []
+                for start_idx, end_idx in long_video_handler.process_in_chunks(total_frames, batch_size):
+                    batch_frames = long_video_handler.load_frame_batch(start_idx, end_idx - start_idx)
+                    processed_frames_list.append(batch_frames)
+                    
+                    # Progress update
+                    progress = (end_idx / total_frames) * 100
+                    print(f"Loading frames: {progress:.1f}%")
+                    
+                    # Memory cleanup between batches
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                
+                # Concatenate all frames
+                processed_frames = torch.cat(processed_frames_list, dim=0)
+                del processed_frames_list
+                
+                # Clean up extracted frames
+                long_video_handler.cleanup()
+                
+            else:
+                # Original batched loading for smaller videos
+                # Improvement: Dynamic batch size based on available memory
+                if torch.cuda.is_available():
+                    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                    # Estimate batch size: ~100MB per frame at 512x512
+                    frame_size_mb = (width * height * 3 * 4) / (1024**2)
+                    safe_batch_size = int((free_gb * 1024 * 0.5) / frame_size_mb)  # Use 50% of free memory
+                    batch_size = min(max(safe_batch_size, 10), 100)  # Between 10-100 frames
+                else:
+                    batch_size = 50  # Default for CPU
+                
+                print(f"Using batch size: {batch_size} frames")
+                processed_frames_list = []
+                
+                # Try to use decord for efficient video reading if available
+                vr = None  # Initialize for cleanup
+                try:
+                    from decord import VideoReader
+                    from decord import cpu
+                    vr = VideoReader(output_video_path, ctx=cpu(0))
+                    
+                    for start_idx in range(0, total_frames, batch_size):
+                        end_idx = min(start_idx + batch_size, total_frames)
+                        batch_frames = vr.get_batch(list(range(start_idx, end_idx)))
+                        batch_frames = torch.from_numpy(batch_frames.asnumpy()).float() / 255.0
+                        processed_frames_list.append(batch_frames)
+                        
+                        # Clear memory periodically
+                        if start_idx + batch_size < total_frames:
+                            gc.collect()
+                    
+                    processed_frames = torch.cat(processed_frames_list, dim=0)
+                    del processed_frames_list
+                    del vr  # Cleanup VideoReader
+                    
+                except ImportError:
+                    # Fallback to ffmpeg extraction
+                    print("Using ffmpeg for video loading...")
+                    
+                    # Create a temporary frames directory
+                    frames_temp_dir = os.path.join(temp_dir, "extracted_frames")
+                    os.makedirs(frames_temp_dir, exist_ok=True)
+                    
+                    # Extract frames using ffmpeg
+                    (
+                        ffmpeg
+                        .input(output_video_path)
+                        .output(os.path.join(frames_temp_dir, "frame_%04d.png"), start_number=0)
+                        .run(quiet=True, overwrite_output=True)
+                    )
+                    
+                    # Load frames in batches
+                    frame_files = sorted([f for f in os.listdir(frames_temp_dir) if f.endswith('.png')])
+                    
+                    for i in range(0, len(frame_files), batch_size):
+                        batch_files = frame_files[i:i+batch_size]
+                        batch_frames = []
+                        
+                        for frame_file in batch_files:
+                            frame_path = os.path.join(frames_temp_dir, frame_file)
+                            frame = Image.open(frame_path)
+                            frame_tensor = torch.from_numpy(np.array(frame)).float() / 255.0
+                            frame.close()  # Fix: Close PIL Image to prevent memory leak
+                            batch_frames.append(frame_tensor)
+                        
+                        batch_tensor = torch.stack(batch_frames)
+                        processed_frames_list.append(batch_tensor)
+                        
+                        # Clear memory
+                        del batch_frames
+                        gc.collect()
+                    
+                    processed_frames = torch.cat(processed_frames_list, dim=0)
+                    del processed_frames_list
+                    
+                    # Clean up extracted frames
+                    shutil.rmtree(frames_temp_dir, ignore_errors=True)
+
+            # Ensure all tensors are on CPU before returning
+            if torch.cuda.is_available():
+                # Move audio waveform to CPU
+                if isinstance(resampled_audio.get("waveform"), torch.Tensor):
+                    if resampled_audio["waveform"].is_cuda:
+                        resampled_audio["waveform"] = resampled_audio["waveform"].cpu()
+                
+                # Move processed frames to CPU
+                if isinstance(processed_frames, torch.Tensor) and processed_frames.is_cuda:
                     processed_frames = processed_frames.cpu()
 
-            return (processed_frames, resampled_audio)
+            # Final memory cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            
+            print(f"Successfully loaded {processed_frames.shape[0]} frames")
+            return (processed_frames, resampled_audio, "")
 
+        except torch.cuda.OutOfMemoryError as e:
+            # Improvement: Better error message for OOM
+            print(f"GPU OUT OF MEMORY ERROR!")
+            print(f"Video info: {total_frames} frames at {width}x{height}")
+            print(f"Try these solutions:")
+            print(f"1. Set output_mode='auto' or 'video_file'")
+            print(f"2. Enable disk_cache=True")
+            print(f"3. Use memory_mode='conservative'")
+            print(f"4. Reduce vram_fraction to 0.6-0.7")
+            raise RuntimeError("GPU memory exhausted. See suggestions above.") from e
         except Exception as e:
             print(f"Error during inference: {str(e)}")
             import traceback
@@ -816,7 +1050,13 @@ class LatentSyncNode:
 
         finally:
             # Clean up temporary files individually
-            for path in [temp_video_path, output_video_path, audio_path]:
+            # Don't delete the permanent output if we're returning a video file
+            paths_to_clean = [temp_video_path, audio_path]
+            if should_return_frames:
+                # Only clean output_video_path if we're returning frames
+                paths_to_clean.append(output_video_path)
+            
+            for path in paths_to_clean:
                 if path and os.path.exists(path):
                     try:
                         os.remove(path)
@@ -839,114 +1079,142 @@ class LatentSyncNode:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-class VideoLengthAdjuster:
+# class VideoLengthAdjuster:
+#     @classmethod
+#     def INPUT_TYPES(s):
+#         return {
+#             "required": {
+#                 "images": ("IMAGE",),
+#                 "audio": ("AUDIO",),
+#                 "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
+#                 "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0}),
+#                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "step": 0.1}),
+#             }
+#         }
+# 
+#     CATEGORY = "LatentSyncNode"
+#     RETURN_TYPES = ("IMAGE", "AUDIO")
+#     RETURN_NAMES = ("images", "audio")
+#     FUNCTION = "adjust"
+# 
+#     def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5):
+#         waveform = audio["waveform"].squeeze(0)
+#         sample_rate = int(audio["sample_rate"])
+#         original_frames = [images[i] for i in range(images.shape[0])] if isinstance(images, torch.Tensor) else images.copy()
+# 
+#         if mode == "normal":
+#             # Add silent padding to the audio and then trim video to match
+#             audio_duration = waveform.shape[1] / sample_rate
+#             
+#             # Add silent padding to the audio
+#             silence_samples = math.ceil(silent_padding_sec * sample_rate)
+#             silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
+#             padded_audio = torch.cat([waveform, silence], dim=1)
+#             
+#             # Calculate required frames based on the padded audio
+#             padded_audio_duration = (waveform.shape[1] + silence_samples) / sample_rate
+#             required_frames = int(padded_audio_duration * fps)
+#             
+#             if len(original_frames) > required_frames:
+#                 # Trim video frames to match padded audio duration
+#                 adjusted_frames = original_frames[:required_frames]
+#             else:
+#                 # If video is shorter than padded audio, keep all video frames
+#                 # and trim the audio accordingly
+#                 adjusted_frames = original_frames
+#                 required_samples = int(len(original_frames) / fps * sample_rate)
+#                 padded_audio = padded_audio[:, :required_samples]
+#             
+#             return (
+#                 torch.stack(adjusted_frames),
+#                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
+#             )
+#             
+#             # This return statement is no longer needed as it's handled in the updated code
+# 
+#         elif mode == "pingpong":
+#             video_duration = len(original_frames) / fps
+#             audio_duration = waveform.shape[1] / sample_rate
+#             if audio_duration <= video_duration:
+#                 required_samples = int(video_duration * sample_rate)
+#                 silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
+#                 adjusted_audio = torch.cat([waveform, silence], dim=1)
+# 
+#                 return (
+#                     torch.stack(original_frames),
+#                     {"waveform": adjusted_audio.unsqueeze(0), "sample_rate": sample_rate}
+#                 )
+# 
+#             else:
+#                 silence_samples = math.ceil(silent_padding_sec * sample_rate)
+#                 silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
+#                 padded_audio = torch.cat([waveform, silence], dim=1)
+#                 total_duration = (waveform.shape[1] + silence_samples) / sample_rate
+#                 target_frames = math.ceil(total_duration * fps)
+#                 reversed_frames = original_frames[::-1][1:-1]  # Remove endpoints
+#                 frames = original_frames + reversed_frames
+#                 while len(frames) < target_frames:
+#                     frames += frames[:target_frames - len(frames)]
+#                 return (
+#                     torch.stack(frames[:target_frames]),
+#                     {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
+#                 )
+# 
+#         elif mode == "loop_to_audio":
+#             # Add silent padding then simple loop
+#             silence_samples = math.ceil(silent_padding_sec * sample_rate)
+#             silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
+#             padded_audio = torch.cat([waveform, silence], dim=1)
+#             total_duration = (waveform.shape[1] + silence_samples) / sample_rate
+#             target_frames = math.ceil(total_duration * fps)
+# 
+#             frames = original_frames.copy()
+#             while len(frames) < target_frames:
+#                 frames += original_frames[:target_frames - len(frames)]
+#             
+#             return (
+#                 torch.stack(frames[:target_frames]),
+#                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
+#             )
+# 
+# 
+# 
+class LatentSyncVideoPathNode(LatentSyncNode):
+    """A version of LatentSyncNode that returns video path instead of frames to avoid memory issues"""
+    
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {
-                "images": ("IMAGE",),
-                "audio": ("AUDIO",),
-                "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
-                "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0}),
-                "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "step": 0.1}),
-            }
-        }
-
-    CATEGORY = "LatentSyncNode"
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
-    FUNCTION = "adjust"
-
-    def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5):
-        waveform = audio["waveform"].squeeze(0)
-        sample_rate = int(audio["sample_rate"])
-        original_frames = [images[i] for i in range(images.shape[0])] if isinstance(images, torch.Tensor) else images.copy()
-
-        if mode == "normal":
-            # Add silent padding to the audio and then trim video to match
-            audio_duration = waveform.shape[1] / sample_rate
-            
-            # Add silent padding to the audio
-            silence_samples = math.ceil(silent_padding_sec * sample_rate)
-            silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-            padded_audio = torch.cat([waveform, silence], dim=1)
-            
-            # Calculate required frames based on the padded audio
-            padded_audio_duration = (waveform.shape[1] + silence_samples) / sample_rate
-            required_frames = int(padded_audio_duration * fps)
-            
-            if len(original_frames) > required_frames:
-                # Trim video frames to match padded audio duration
-                adjusted_frames = original_frames[:required_frames]
-            else:
-                # If video is shorter than padded audio, keep all video frames
-                # and trim the audio accordingly
-                adjusted_frames = original_frames
-                required_samples = int(len(original_frames) / fps * sample_rate)
-                padded_audio = padded_audio[:, :required_samples]
-            
-            return (
-                torch.stack(adjusted_frames),
-                {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-            )
-            
-            # This return statement is no longer needed as it's handled in the updated code
-
-        elif mode == "pingpong":
-            video_duration = len(original_frames) / fps
-            audio_duration = waveform.shape[1] / sample_rate
-            if audio_duration <= video_duration:
-                required_samples = int(video_duration * sample_rate)
-                silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
-                adjusted_audio = torch.cat([waveform, silence], dim=1)
-
-                return (
-                    torch.stack(original_frames),
-                    {"waveform": adjusted_audio.unsqueeze(0), "sample_rate": sample_rate}
-                )
-
-            else:
-                silence_samples = math.ceil(silent_padding_sec * sample_rate)
-                silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-                padded_audio = torch.cat([waveform, silence], dim=1)
-                total_duration = (waveform.shape[1] + silence_samples) / sample_rate
-                target_frames = math.ceil(total_duration * fps)
-                reversed_frames = original_frames[::-1][1:-1]  # Remove endpoints
-                frames = original_frames + reversed_frames
-                while len(frames) < target_frames:
-                    frames += frames[:target_frames - len(frames)]
-                return (
-                    torch.stack(frames[:target_frames]),
-                    {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-                )
-
-        elif mode == "loop_to_audio":
-            # Add silent padding then simple loop
-            silence_samples = math.ceil(silent_padding_sec * sample_rate)
-            silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
-            padded_audio = torch.cat([waveform, silence], dim=1)
-            total_duration = (waveform.shape[1] + silence_samples) / sample_rate
-            target_frames = math.ceil(total_duration * fps)
-
-            frames = original_frames.copy()
-            while len(frames) < target_frames:
-                frames += original_frames[:target_frames - len(frames)]
-            
-            return (
-                torch.stack(frames[:target_frames]),
-                {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
-            )
-
-
+        # Get parent inputs and modify for video path output
+        inputs = super().INPUT_TYPES()
+        # Remove return_frames and output_mode since we force them
+        if "return_frames" in inputs["required"]:
+            del inputs["required"]["return_frames"]
+        if "output_mode" in inputs["required"]:
+            del inputs["required"]["output_mode"]
+        return inputs
+    
+    RETURN_TYPES = ("STRING", "AUDIO")
+    RETURN_NAMES = ("video_path", "audio")
+    FUNCTION = "inference_path"
+    
+    def inference_path(self, images, audio, seed, lips_expression=1.5, inference_steps=20, vram_fraction=0.0, optimization_level="balanced", memory_mode="balanced", enable_disk_cache=False, output_mode="video_file"):
+        # Call parent inference with output_mode="video_file" to ensure we get a path
+        _, audio_output, video_path = super().inference(
+            images, audio, seed, lips_expression, inference_steps, 
+            vram_fraction, optimization_level, memory_mode, enable_disk_cache, 
+            return_frames=False, output_mode="video_file"
+        )
+        
+        return (video_path, audio_output)
 
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
     "LatentSyncNode": LatentSyncNode,
-    "VideoLengthAdjuster": VideoLengthAdjuster,
+    # Removed LatentSyncVideoPathNode - main node now outputs video_path directly
 }
 
 # Display Names for ComfyUI
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LatentSyncNode": "LatentSync1.6 Node",
-    "VideoLengthAdjuster": "Video Length Adjuster",
+    "LatentSyncNode": "🎭 LatentSync 1.6 (MEMSAFE)",
+    # Removed redundant video path node
 }

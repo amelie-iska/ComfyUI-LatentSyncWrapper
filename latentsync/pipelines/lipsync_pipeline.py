@@ -278,6 +278,7 @@ class LipsyncPipeline(DiffusionPipeline):
             face = torchvision.transforms.functional.resize(
                 face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
             )
+            # Face should remain as tensor in CHW format for our restore_img implementation
             out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
@@ -375,7 +376,19 @@ class LipsyncPipeline(DiffusionPipeline):
 
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
-        synced_video_frames = []
+        # Instead of accumulating frames in memory, we'll write to disk
+        import tempfile
+        import cv2
+        
+        # Create temporary directory for processed frames
+        # Use system temp if no temp_dir provided
+        base_temp = getattr(self, 'temp_dir', None) or tempfile.gettempdir()
+        temp_output_dir = os.path.join(base_temp, f"latentsync_frames_{os.getpid()}")
+        os.makedirs(temp_output_dir, exist_ok=True)
+        frame_index = 0
+        
+        # Don't accumulate frames in memory anymore
+        # synced_video_frames = []
 
         num_channels_latents = self.vae.config.latent_channels
 
@@ -393,8 +406,24 @@ class LipsyncPipeline(DiffusionPipeline):
 
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
-            # Clear GPU cache periodically to prevent lag
-            if i > 0 and i % 2 == 0:
+            # Enhanced memory clearing to prevent end-stage lag
+            progress = i / num_inferences
+            
+            # Progressive memory clearing - more aggressive as we progress
+            if progress > 0.8:  # Last 20% of iterations
+                # Very aggressive clearing every iteration
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                import gc
+                gc.collect(2)  # Full collection
+            elif progress > 0.6:  # 60-80% through
+                # Moderate clearing every iteration
+                if i > 0:
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+            elif i > 0 and i % 2 == 0:  # First 60%
+                # Normal clearing every 2 iterations
                 torch.cuda.empty_cache()
                 import gc
                 gc.collect()
@@ -471,11 +500,53 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
-            synced_video_frames.append(decoded_latents)
+            # Write frames to disk instead of accumulating in memory
+            # First restore the frames for this chunk
+            chunk_start = i * num_frames
+            chunk_end = min((i + 1) * num_frames, len(video_frames))
+            chunk_video_frames = video_frames[chunk_start:chunk_end]
+            chunk_boxes = boxes[chunk_start:chunk_end]
+            chunk_affine_matrices = affine_matrices[chunk_start:chunk_end]
             
-            # Clear intermediate tensors to free memory
+            # Restore video for this chunk
+            restored_chunk = self.restore_video(
+                decoded_latents, 
+                chunk_video_frames, 
+                chunk_boxes, 
+                chunk_affine_matrices
+            )
+            
+            # Write frames to disk
+            for j, frame in enumerate(restored_chunk):
+                frame_path = os.path.join(temp_output_dir, f"frame_{frame_index:06d}.png")
+                
+                # Debug: log frame info for first frame of first chunk
+                if frame_index == 0:
+                    print(f"Debug - Frame type: {type(frame)}, dtype: {frame.dtype if hasattr(frame, 'dtype') else 'N/A'}")
+                    print(f"Debug - Frame shape: {frame.shape if hasattr(frame, 'shape') else 'N/A'}")
+                    if hasattr(frame, 'max') and hasattr(frame, 'min'):
+                        print(f"Debug - Frame range: [{frame.min():.3f}, {frame.max():.3f}]")
+                
+                # Convert to numpy if it's a tensor, otherwise it's already numpy
+                if torch.is_tensor(frame):
+                    frame_np = (frame.cpu().numpy() * 255).astype(np.uint8)
+                else:
+                    # Already numpy array - check if it needs scaling
+                    if frame.dtype == np.float32 or frame.dtype == np.float64:
+                        # Float array, scale it
+                        frame_np = (frame * 255).astype(np.uint8) if frame.max() <= 1.0 else frame.astype(np.uint8)
+                    else:
+                        # Already uint8
+                        frame_np = frame
+                
+                # The restored frames are in RGB format, convert to BGR for cv2
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(frame_path, frame_bgr)
+                frame_index += 1
+            
+            # Clear ALL memory including the decoded frames
             del latents, mask_latents, masked_image_latents, ref_latents
-            del decoded_latents, noise_pred
+            del decoded_latents, noise_pred, restored_chunk
             if 'unet_input' in locals():
                 del unet_input
             
@@ -485,22 +556,48 @@ class LipsyncPipeline(DiffusionPipeline):
                 import gc
                 gc.collect()
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
-
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        # All frames have been written to disk, now create video from frames
+        # Count total frames processed
+        total_frames = frame_index
+        
+        audio_samples_remain_length = int(total_frames / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
 
         if is_train:
             self.unet.train()
 
-        temp_dir = "temp"
+        # Use the same base temp as frames for consistency
+        temp_dir = os.path.join(base_temp, f"latentsync_final_{os.getpid()}")
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
 
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=25)
+        # Create video from frames on disk using ffmpeg (no memory usage)
+        video_path = os.path.join(temp_dir, "video.mp4")
+        frame_pattern = os.path.join(temp_output_dir, "frame_%06d.png")
+        
+        try:
+            # Use ffmpeg to create video from frames
+            subprocess.run([
+                "ffmpeg", "-y", "-r", str(video_fps), "-i", frame_pattern,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", video_path
+            ], check=True)
 
-        sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
+            sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
-        subprocess.run(command, shell=True)
+            # Fix: Use list of arguments instead of shell=True to prevent injection
+            command = [
+                "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+                "-i", os.path.join(temp_dir, "video.mp4"),
+                "-i", os.path.join(temp_dir, "audio.wav"),
+                "-c:v", "libx264", "-crf", "18",
+                "-c:a", "aac", "-q:v", "0", "-q:a", "0",
+                video_out_path
+            ]
+            subprocess.run(command, check=True)
+        finally:
+            # Always clean up temporary directories
+            if os.path.exists(temp_output_dir):
+                shutil.rmtree(temp_output_dir)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)

@@ -29,7 +29,7 @@ class GPUConfigNode:
                 "save_settings": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "trigger": ("*",),  # Any input to trigger reconfiguration
+                "trigger": ("STRING",),  # String input to trigger reconfiguration
             }
         }
     
@@ -176,6 +176,6 @@ GPU_NODE_CLASS_MAPPINGS = {
 }
 
 GPU_NODE_DISPLAY_NAME_MAPPINGS = {
-    "GPUConfigNode": "GPU Configuration",
-    "GPUBenchmarkNode": "GPU Benchmark",
+    "GPUConfigNode": "🖥️ GPU Configuration",
+    "GPUBenchmarkNode": "📊 GPU Benchmark",
 }

@@ -34,8 +34,8 @@ except Exception:
 def clear_cache_periodically():
     """Clear GPU cache to free memory."""
     if torch.cuda.is_available():
+        torch.cuda.synchronize()  # Fix: Synchronize BEFORE clearing cache
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
     gc.collect()
 
 
