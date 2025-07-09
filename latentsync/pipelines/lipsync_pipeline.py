@@ -30,6 +30,7 @@ from diffusers.utils import deprecate, logging
 
 from einops import rearrange
 import cv2
+from concurrent.futures import ThreadPoolExecutor
 import tqdm
 
 from ..models.unet import UNet3DConditionModel
@@ -649,6 +650,11 @@ class LipsyncPipeline(DiffusionPipeline):
         temp_output_dir = os.path.join(base_temp, f"latentsync_frames_{os.getpid()}")
         os.makedirs(temp_output_dir, exist_ok=True)
         frame_index = 0
+
+        # Use a thread pool to write frames asynchronously
+        writer_threads = int(os.environ.get('LATENTSYNC_WRITE_THREADS', '4'))
+        frame_executor = ThreadPoolExecutor(max_workers=writer_threads)
+        frame_futures = []
         
         # Don't accumulate frames in memory anymore
         # synced_video_frames = []
@@ -880,7 +886,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 
                 # The restored frames are in RGB format, convert to BGR for cv2
                 frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(frame_path, frame_bgr)
+                frame_futures.append(frame_executor.submit(cv2.imwrite, frame_path, frame_bgr))
                 frame_index += 1
             
             # Clear ALL memory including the decoded frames
@@ -906,6 +912,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 torch.cuda.empty_cache()
                 import gc
                 gc.collect()
+
+        # Ensure all frame writes have completed
+        for f in frame_futures:
+            f.result()
+        frame_executor.shutdown(wait=True)
 
         # All frames have been written to disk, now create video from frames
         # Count total frames processed

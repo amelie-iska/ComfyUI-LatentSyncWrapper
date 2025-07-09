@@ -204,6 +204,16 @@ The processed video will be saved in ComfyUI's output directory.
 - If you need higher quality results and have time to wait, increase inference_steps to 30-50
 - For quicker previews or less critical applications, reduce inference_steps to 10-15
 
+### Optional Environment Variables
+
+- `LATENTSYNC_YIELD_MS`: controls how often the GPU throttle yields to the display.
+  Set this to `0` to disable yielding for maximum speed (default `1`).
+- `LATENTSYNC_DISABLE_SYNC`: set to `1` to skip `torch.cuda.synchronize()` calls
+  in the throttle manager if you experience stutter-free performance on high-end
+  GPUs.
+- `LATENTSYNC_WRITE_THREADS`: number of threads to use for asynchronous frame
+  writing. Increase for faster disk writes (default `4`).
+
 ## Known Limitations
 
 - Works best with clear, frontal face videos
