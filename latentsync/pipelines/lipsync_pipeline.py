@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 from typing import Callable, List, Optional, Union
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 
 import numpy as np
@@ -649,6 +650,9 @@ class LipsyncPipeline(DiffusionPipeline):
         temp_output_dir = os.path.join(base_temp, f"latentsync_frames_{os.getpid()}")
         os.makedirs(temp_output_dir, exist_ok=True)
         frame_index = 0
+        # Use a thread pool for asynchronous frame writes to reduce blocking
+        write_executor = ThreadPoolExecutor(max_workers=4)
+        pending_writes = []
         
         # Don't accumulate frames in memory anymore
         # synced_video_frames = []
@@ -880,7 +884,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 
                 # The restored frames are in RGB format, convert to BGR for cv2
                 frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(frame_path, frame_bgr)
+                pending_writes.append(write_executor.submit(cv2.imwrite, frame_path, frame_bgr))
+                if len(pending_writes) >= 16:
+                    pending_writes.pop(0).result()
                 frame_index += 1
             
             # Clear ALL memory including the decoded frames
@@ -906,6 +912,11 @@ class LipsyncPipeline(DiffusionPipeline):
                 torch.cuda.empty_cache()
                 import gc
                 gc.collect()
+
+        # ensure all pending frame writes are completed
+        for fut in pending_writes:
+            fut.result()
+        write_executor.shutdown()
 
         # All frames have been written to disk, now create video from frames
         # Count total frames processed
