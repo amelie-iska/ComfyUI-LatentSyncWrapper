@@ -1,6 +1,12 @@
 """
 GPU Throttling and Display Priority Management
 Prevents inference from monopolizing the GPU and causing system lag
+
+Environment variables:
+    - ``LATENTSYNC_YIELD_MS``: override how often ``yield_to_display`` sleeps.
+      Set to ``0`` to disable yielding completely (default ``1`` ms).
+    - ``LATENTSYNC_DISABLE_SYNC``: if ``1`` skip ``torch.cuda.synchronize`` in
+      ``yield_to_display``.
 """
 
 import torch
@@ -18,7 +24,11 @@ class GPUThrottleManager:
         self.gpu_usage_target = 0.85  # Leave 15% for display
         self.frame_time_target = 16.67  # 60 FPS target (ms)
         self.last_yield_time = time.time()
-        self.yield_interval = 0.001  # Yield every 1ms
+
+        # Allow tuning of yield behaviour via environment variables
+        yield_ms = float(os.environ.get('LATENTSYNC_YIELD_MS', '1'))
+        self.yield_interval = yield_ms / 1000.0
+        self.disable_sync = os.environ.get('LATENTSYNC_DISABLE_SYNC', '0') == '1'
         
         # Set CUDA environment for display priority
         os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
@@ -33,10 +43,14 @@ class GPUThrottleManager:
             os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,garbage_collection_threshold:0.7'
     
     def yield_to_display(self):
-        """Yield GPU to display rendering"""
+        """Yield GPU to display rendering if enabled"""
+        if self.yield_interval <= 0:
+            return
+
         current_time = time.time()
         if current_time - self.last_yield_time > self.yield_interval:
-            torch.cuda.synchronize()
+            if torch.cuda.is_available() and not self.disable_sync:
+                torch.cuda.synchronize()
             time.sleep(0.0001)  # Tiny sleep to yield
             self.last_yield_time = current_time
     
@@ -95,6 +109,7 @@ class StreamedInference:
 
 def create_display_friendly_inference():
     """Creates an inference configuration that won't lag the display"""
+    yield_ms = float(os.environ.get('LATENTSYNC_YIELD_MS', '1'))
     config = {
         'gpu_throttle': GPUThrottleManager(),
         'streamed_inference': StreamedInference(),
@@ -103,7 +118,7 @@ def create_display_friendly_inference():
             'enable_time_slicing': True,
             'display_priority_mode': True,
             'inference_streams': 4,
-            'yield_frequency_ms': 1,
+            'yield_frequency_ms': yield_ms,
             'memory_reserve_fraction': 0.15,
             'enable_async_compute': True,
             'reduce_memory_fragmentation': True
