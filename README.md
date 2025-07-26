@@ -204,6 +204,29 @@ The processed video will be saved in ComfyUI's output directory.
 - If you need higher quality results and have time to wait, increase inference_steps to 30-50
 - For quicker previews or less critical applications, reduce inference_steps to 10-15
 
+### Optional Environment Variables
+
+- `LATENTSYNC_YIELD_MS`: controls how often the GPU throttle yields to the display.
+  Set this to `0` to disable yielding for maximum speed (default `1`).
+- `LATENTSYNC_DISABLE_SYNC`: set to `1` to skip `torch.cuda.synchronize()` calls
+  in the throttle manager if you experience stutter-free performance on high-end
+  GPUs.
+- `LATENTSYNC_WRITE_THREADS`: number of threads to use for asynchronous frame
+  writing. Increase for faster disk writes (default `4`).
+- `LATENTSYNC_QUANTIZED`: set to `1` to load quantized models (see below) for
+  lower VRAM usage.
+
+Enabling quantization converts the U-Net to FP8 precision while the VAE,
+SyncNet, VideoMAE, and face detector run with INT8 weights. Whisper remains at
+FP16. This drops the overall VRAM requirement from roughly **12‑15&nbsp;GB** to
+around **3.5‑4&nbsp;GB**, a 70‑75% reduction, making LatentSync runnable on GPUs
+with as little as 8‑12&nbsp;GB of memory.
+
+### TensorRT Acceleration (Experimental)
+
+For a step-by-step guide on exporting the U-Net to ONNX and compiling a TensorRT
+engine, see [TENSORRT_ACCELERATION_GUIDE.md](TENSORRT_ACCELERATION_GUIDE.md).
+
 ## Known Limitations
 
 - Works best with clear, frontal face videos
