@@ -214,6 +214,11 @@ The processed video will be saved in ComfyUI's output directory.
 - `LATENTSYNC_WRITE_THREADS`: number of threads to use for asynchronous frame
   writing. Increase for faster disk writes (default `4`).
 
+### TensorRT Acceleration (Experimental)
+
+For a step-by-step guide on exporting the U-Net to ONNX and compiling a TensorRT
+engine, see [TENSORRT_ACCELERATION_GUIDE.md](TENSORRT_ACCELERATION_GUIDE.md).
+
 ## Known Limitations
 
 - Works best with clear, frontal face videos
